@@ -45,6 +45,44 @@ SymlinkEntry = Tuple[Literal['symlink'], str]         # ('symlink', target)
 
 
 @dataclass
+class User:
+    """
+    Declarative user configuration.
+
+    Created with initial settings, then mutated by helper methods.
+    """
+    name: str
+    uid: int = 1000
+    shell: str = "/bin/bash"
+    password_hash: str | None = None
+    groups: Set[str] = field(default_factory=set)
+
+    def add_groups(self, *names: str) -> "User":
+        """Add groups to the user."""
+        self.groups.update(names)
+        return self
+
+    def to_dict(self) -> dict:
+        """Serialize user to a dict."""
+        return {
+            "uid": self.uid,
+            "shell": self.shell,
+            "password_hash": self.password_hash,
+            "groups": sorted(self.groups),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "User":
+        """Deserialize user from a dict."""
+        user = cls(name=data["name"])
+        user.uid = data.get("uid", 1000)
+        user.shell = data.get("shell", "/bin/bash")
+        user.password_hash = data.get("password_hash")
+        user.groups = set(data.get("groups", []))
+        return user
+
+
+@dataclass
 class ConfigDiff:
     """Differences between two configs."""
     packages_to_install: Set[str]
@@ -83,13 +121,6 @@ class Config:
 
     Build up with helper methods, then pass to build functions.
     """
-    name: str
-
-    # System settings
-    hostname: str = ""
-    timezone: str = "UTC"
-    locale: str = "en_US.UTF-8"
-    keymap: str = "us"
 
     # All packages (passed to pacstrap)
     packages: Set[str] = field(default_factory=lambda: {
@@ -104,9 +135,8 @@ class Config:
         "btrfs", "ata_piix", "ahci", "sd_mod", "virtio_blk", "virtio_pci"
     })
 
-    def __post_init__(self):
-        if not self.hostname:
-            self.hostname = self.name
+    # User (optional)
+    user: User | None = None
 
     # -------------------------------------------------------------------------
     # Builder methods
@@ -144,23 +174,19 @@ class Config:
 
     def set_timezone(self, tz: str) -> "Config":
         """Set system timezone."""
-        self.timezone = tz
         return self.add_symlink("/etc/localtime", f"/usr/share/zoneinfo/{tz}")
 
     def set_locale(self, locale: str) -> "Config":
         """Set system locale."""
-        self.locale = locale
         self.add_file("/etc/locale.gen", f"{locale} UTF-8\n")
         return self.add_file("/etc/locale.conf", f"LANG={locale}\n")
 
     def set_keymap(self, keymap: str) -> "Config":
         """Set console keymap."""
-        self.keymap = keymap
         return self.add_file("/etc/vconsole.conf", f"KEYMAP={keymap}\n")
 
     def set_hostname(self, hostname: str) -> "Config":
         """Set hostname and generate /etc/hosts."""
-        self.hostname = hostname
         self.add_file("/etc/hostname", f"{hostname}\n")
         hosts_content = f"""127.0.0.1   localhost
 ::1         localhost
@@ -179,29 +205,24 @@ class Config:
         for path, entry in self.files.items():
             files_serialized[path] = list(entry)
         return {
-            "name": self.name,
-            "hostname": self.hostname,
-            "timezone": self.timezone,
-            "locale": self.locale,
-            "keymap": self.keymap,
             "packages": sorted(self.packages),
             "files": files_serialized,
             "initramfs_modules": sorted(self.initramfs_modules),
+            "user": self.user.to_dict() if self.user else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Config":
         """Deserialize config from a dict."""
-        config = cls(name=data["name"])
-        config.hostname = data.get("hostname", config.name)
-        config.timezone = data.get("timezone", "UTC")
-        config.locale = data.get("locale", "en_US.UTF-8")
-        config.keymap = data.get("keymap", "us")
+        config = cls()
         config.packages = set(data.get("packages", []))
         config.initramfs_modules = set(data.get("initramfs_modules", []))
         # Convert files: lists back to tuples
         for path, entry in data.get("files", {}).items():
             config.files[path] = tuple(entry)
+        # Deserialize user if present
+        if data.get("user"):
+            config.user = User.from_dict(data["user"])
         return config
 
     def to_json(self) -> str:
@@ -245,6 +266,7 @@ class TestOptions:
     image: str
     memory: str = "4G"
     cpus: int = 2
+    graphics: bool = False
 
 
 # =============================================================================
@@ -442,6 +464,60 @@ menuentry "Arch Linux (gen-{g.gen}, {created_str})" {{
     return header + "".join(entries) + "\n"
 
 
+def configure_user(user: User, gen_root: Path, home_path: Path):
+    """
+    Configure the declarative user in the generation.
+
+    Reads base system users from generation's /etc, appends declarative user,
+    writes back. Also creates home directory in @home.
+    """
+    etc = gen_root / "etc"
+
+    # Read base system files
+    passwd_lines = [l for l in (etc / "passwd").read_text().splitlines()
+                    if l and not l.startswith(f"{user.name}:")]
+    shadow_lines = [l for l in (etc / "shadow").read_text().splitlines()
+                    if l and not l.startswith(f"{user.name}:")]
+    group_lines = [l for l in (etc / "group").read_text().splitlines()
+                   if l and not l.startswith(f"{user.name}:")]
+    gshadow_lines = [l for l in (etc / "gshadow").read_text().splitlines()
+                     if l and not l.startswith(f"{user.name}:")]
+
+    # Add user entry
+    passwd_lines.append(f"{user.name}:x:{user.uid}:{user.uid}::/home/{user.name}:{user.shell}")
+    pw_hash = user.password_hash if user.password_hash else "!"
+    shadow_lines.append(f"{user.name}:{pw_hash}:19000:0:99999:7:::")
+    group_lines.append(f"{user.name}:x:{user.uid}:")
+    gshadow_lines.append(f"{user.name}:!::")
+
+    # Add user to supplementary groups
+    new_group_lines = []
+    for line in group_lines:
+        parts = line.split(":")
+        if len(parts) >= 4 and parts[0] in user.groups:
+            members = [m for m in parts[3].split(",") if m]
+            if user.name not in members:
+                members.append(user.name)
+            parts[3] = ",".join(members)
+        new_group_lines.append(":".join(parts))
+
+    # Write back to generation
+    (etc / "passwd").write_text("\n".join(passwd_lines) + "\n")
+    (etc / "shadow").write_text("\n".join(shadow_lines) + "\n")
+    (etc / "shadow").chmod(0o600)
+    (etc / "group").write_text("\n".join(new_group_lines) + "\n")
+    (etc / "gshadow").write_text("\n".join(gshadow_lines) + "\n")
+    (etc / "gshadow").chmod(0o600)
+
+    # Create home directory in @home if needed
+    user_home = home_path / user.name
+    if not user_home.exists():
+        user_home.mkdir(parents=True, exist_ok=True)
+        user_home.chmod(0o700)
+        os.chown(user_home, user.uid, user.uid)
+        print(f"  Created home directory: {user_home}")
+
+
 # =============================================================================
 # Build context and functions
 # =============================================================================
@@ -599,18 +675,9 @@ def build_generation(config: Config, ctx: BuildContext):
         provision_conf = re.sub(r'^[df].*\s/root.*\n', '', provision_conf, flags=re.MULTILINE)
         (tmpfiles_dir / "provision.conf").write_text(provision_conf)
 
-        print("\n=== Setting up persistent /etc files ===")
+        print("\n=== Setting up /etc symlinks ===")
         # Fix directory permissions (pacstrap/systemd may have changed them)
-        (ctx.var_path / "lib/users").chmod(0o755)
         (ctx.var_path / "lib/machines").chmod(0o755)
-
-        # User management files: copy to @var on fresh install, just symlink on rebuild
-        for name in ["passwd", "shadow", "group", "gshadow"]:
-            src = ctx.mount_root / "etc" / name
-            dst = ctx.var_path / "lib/users" / name
-            if ctx.fresh_install and src.exists() and not src.is_symlink():
-                shutil.copy2(src, dst)
-            force_symlink(src, f"/var/lib/users/{name}")
 
         # resolv.conf: symlink to /run (systemd-resolved or NetworkManager will manage)
         force_symlink(ctx.mount_root / "etc/resolv.conf", "/run/systemd/resolve/stub-resolv.conf")
@@ -760,7 +827,6 @@ def image_file(image_path: str, size: str = "10G"):
             run(["btrfs", "subvol", "create", str(mount_point / "@home")])
 
             (mount_point / "@home/root").mkdir(mode=0o700, parents=True, exist_ok=True)
-            (mount_point / "@var/lib/users").mkdir(parents=True, exist_ok=True)
             (mount_point / "@var/lib/machines").mkdir(parents=True, exist_ok=True)
 
             run(["umount", str(mount_point)])
@@ -970,6 +1036,15 @@ def apply_configuration(opts: ApplyOptions) -> str:
 
             build_incremental(diff, ctx)
 
+        # Configure declarative user if specified
+        if config.user:
+            print(f"\n=== Configuring user: {config.user.name} ===")
+            home_mount = ctx.mount_root / "home"
+            home_mount.mkdir(exist_ok=True)
+            with mount(ctx.btrfs_dev, home_mount, "subvol=@home"):
+                configure_user(config.user, ctx.mount_root, home_mount)
+            print(f"  Groups: {sorted(config.user.groups)}")
+
         # Save config
         print("\n=== Saving config ===")
         (ctx.mount_root / "config.json").write_text(config.to_json())
@@ -1019,33 +1094,50 @@ def test_image(opts: TestOptions) -> int:
     ovmf_code, ovmf_vars = ovmf
     print(f"Starting QEMU with image: {opts.image}")
     print(f"OVMF: {ovmf_code}")
+    print(f"Mode: {'graphics' if opts.graphics else 'serial console'}")
 
     # Create a temporary copy of OVMF_VARS (it's writable)
     vars_copy = tempfile.NamedTemporaryFile(delete=False)
     vars_copy.write(ovmf_vars.read_bytes())
     vars_copy.close()
 
-    logfile = Path("qemu-console.log")
-    print(f"Logging console output to: {logfile}")
-    print("Exit with: Ctrl-A X")
-    print()
+    cmd = [
+        "qemu-system-x86_64",
+        "-enable-kvm",
+        "-cpu", "host",
+        "-m", opts.memory,
+        "-smp", str(opts.cpus),
+        "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
+        "-drive", f"if=pflash,format=raw,file={vars_copy.name}",
+        "-drive", f"file={opts.image},format=raw",
+        "-net", "none",
+        "-usb",
+        "-device", "usb-tablet",
+    ]
 
-    try:
-        subprocess.run([
-            "qemu-system-x86_64",
-            "-enable-kvm",
-            "-cpu", "host",
-            "-m", opts.memory,
-            "-smp", str(opts.cpus),
-            "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
-            "-drive", f"if=pflash,format=raw,file={vars_copy.name}",
-            "-drive", f"file={opts.image},format=raw",
-            "-net", "none",
+    if opts.graphics:
+        # Virtio GPU with OpenGL acceleration
+        cmd += [
+            "-device", "virtio-vga",
+            "-display", "gtk",
+        ]
+        print("Close window to exit")
+    else:
+        # Serial console mode
+        logfile = Path("qemu-console.log")
+        print(f"Logging console output to: {logfile}")
+        print("Exit with: Ctrl-A X")
+        cmd += [
             "-nographic",
             "-chardev", f"stdio,mux=on,id=char0,logfile={logfile},signal=off",
             "-serial", "chardev:char0",
             "-mon", "chardev=char0",
-        ])
+        ]
+
+    print()
+
+    try:
+        run(cmd)
     finally:
         Path(vars_copy.name).unlink(missing_ok=True)
 
@@ -1075,6 +1167,7 @@ def main() -> int:
     p_test.add_argument("image", help="Path to disk image")
     p_test.add_argument("--memory", default="4G", help="VM memory (default: 4G)")
     p_test.add_argument("--cpus", type=int, default=2, help="Number of CPUs (default: 2)")
+    p_test.add_argument("--graphics", action="store_true", help="Enable graphical display (virtio-gpu)")
 
     args = parser.parse_args()
 
@@ -1083,6 +1176,7 @@ def main() -> int:
             image=args.image,
             memory=args.memory,
             cpus=args.cpus,
+            graphics=args.graphics,
         ))
 
     # Commands below require root

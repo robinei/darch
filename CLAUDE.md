@@ -89,7 +89,12 @@ New generations are created as btrfs snapshots of the previous, making increment
 
 ### User Management
 
-User files (`/etc/passwd`, `/etc/shadow`, etc.) are symlinks to `/var/lib/users/`. On first build, the files are copied to @var. This makes users persistent across generations without declaring them in config.
+Users are declared in config via the `User` class. User files (`/etc/passwd`, `/etc/shadow`, etc.) are written directly to the generation's /etc directory at build time. This keeps users immutable per generation, consistent with the declarative design. Home directories are created in @home (persistent).
+
+```python
+config.user = User("robin", shell="/bin/fish", groups={"wheel", "seat"})
+config.user.add_groups("video", "audio")  # Can add groups later (e.g., from helper functions)
+```
 
 ### Initramfs Hook
 
@@ -110,7 +115,8 @@ A custom mkinitcpio hook (`darch`) overrides the mount handler to:
 6. Remove /var from generation
 7. Mount @var, create pacman symlink
 8. Run chroot configuration
-9. Save config.json
+9. Configure declarative user (if set)
+10. Save config.json
 
 ### Incremental Build
 1. Snapshot previous generation
@@ -118,7 +124,8 @@ A custom mkinitcpio hook (`darch`) overrides the mount handler to:
 3. Apply package diff with pacman
 4. Apply file changes
 5. Regenerate initramfs if needed
-6. Save config.json
+6. Configure declarative user (if set)
+7. Save config.json
 
 ## Configuration
 
@@ -131,6 +138,7 @@ def configure() -> Config:
     config.set_hostname("myvm")
     config.set_timezone("UTC")
     config.enable_service("sshd")
+    config.user = User("robin", shell="/bin/bash", groups={"wheel"})
     return config
 ```
 
@@ -149,7 +157,8 @@ sudo ./darch.py apply --image myvm.img --config config.py --rebuild
 sudo ./darch.py apply --image myvm.img --config config.py --upgrade
 
 # Boot image in QEMU for testing (no root needed)
-./darch.py test myvm.img
+./darch.py test myvm.img                      # serial console
+./darch.py test myvm.img --graphics           # graphical (virtio-gpu)
 ./darch.py test myvm.img --memory 8G --cpus 4
 ```
 
