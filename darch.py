@@ -13,7 +13,7 @@ from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Set, Dict, Tuple, Literal
+from typing import Set, Dict, Tuple, Literal, Iterator
 import argparse
 import fcntl
 import importlib.util
@@ -65,6 +65,7 @@ class User:
     def to_dict(self) -> dict:
         """Serialize user to a dict."""
         return {
+            "name": self.name,
             "uid": self.uid,
             "shell": self.shell,
             "password_hash": self.password_hash,
@@ -92,7 +93,7 @@ class ConfigDiff:
     files_to_update: Dict[str, FileEntry | SymlinkEntry]
 
     @classmethod
-    def compute(cls, old: Config, new: Config) -> "ConfigDiff":
+    def compute(cls, old: Config, new: Config) -> ConfigDiff:
         """Compare two configs and return the differences."""
         return cls(
             packages_to_install=new.packages - old.packages,
@@ -142,22 +143,22 @@ class Config:
     # Builder methods
     # -------------------------------------------------------------------------
 
-    def add_packages(self, *names: str) -> "Config":
+    def add_packages(self, *names: str) -> Config:
         """Add packages to install."""
         self.packages.update(names)
         return self
 
-    def add_file(self, path: str, content: str, mode: int | None = None) -> "Config":
+    def add_file(self, path: str, content: str, mode: int | None = None) -> Config:
         """Add a file with content and optional mode."""
         self.files[path] = ('file', content, mode)
         return self
 
-    def add_symlink(self, path: str, target: str) -> "Config":
+    def add_symlink(self, path: str, target: str) -> Config:
         """Add a symlink."""
         self.files[path] = ('symlink', target)
         return self
 
-    def enable_service(self, name: str) -> "Config":
+    def enable_service(self, name: str) -> Config:
         """Enable a systemd service (creates symlink)."""
         if not name.endswith(('.service', '.socket', '.timer', '.path', '.mount')):
             name = f"{name}.service"
@@ -166,26 +167,26 @@ class Config:
             f"/usr/lib/systemd/system/{name}"
         )
 
-    def mask_service(self, name: str) -> "Config":
+    def mask_service(self, name: str) -> Config:
         """Mask a systemd service (symlink to /dev/null)."""
         if not name.endswith(('.service', '.socket', '.timer', '.path', '.mount')):
             name = f"{name}.service"
         return self.add_symlink(f"/etc/systemd/system/{name}", "/dev/null")
 
-    def set_timezone(self, tz: str) -> "Config":
+    def set_timezone(self, tz: str) -> Config:
         """Set system timezone."""
         return self.add_symlink("/etc/localtime", f"/usr/share/zoneinfo/{tz}")
 
-    def set_locale(self, locale: str) -> "Config":
+    def set_locale(self, locale: str) -> Config:
         """Set system locale."""
         self.add_file("/etc/locale.gen", f"{locale} UTF-8\n")
         return self.add_file("/etc/locale.conf", f"LANG={locale}\n")
 
-    def set_keymap(self, keymap: str) -> "Config":
+    def set_keymap(self, keymap: str) -> Config:
         """Set console keymap."""
         return self.add_file("/etc/vconsole.conf", f"KEYMAP={keymap}\n")
 
-    def set_hostname(self, hostname: str) -> "Config":
+    def set_hostname(self, hostname: str) -> Config:
         """Set hostname and generate /etc/hosts."""
         self.add_file("/etc/hostname", f"{hostname}\n")
         hosts_content = f"""127.0.0.1   localhost
@@ -212,7 +213,7 @@ class Config:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Config":
+    def from_dict(cls, data: dict) -> Config:
         """Deserialize config from a dict."""
         config = cls()
         config.packages = set(data.get("packages", []))
@@ -230,7 +231,7 @@ class Config:
         return json.dumps(self.to_dict(), indent=2, sort_keys=True)
 
     @classmethod
-    def from_json(cls, s: str) -> "Config":
+    def from_json(cls, s: str) -> Config:
         """Deserialize config from JSON string."""
         return cls.from_dict(json.loads(s))
 
@@ -246,27 +247,6 @@ class GenerationInfo:
     path: Path
     complete: bool              # True if config.json exists
     created_at: float | None    # Unix timestamp (None if incomplete)
-
-
-@dataclass
-class ApplyOptions:
-    """Typed options for the apply command."""
-    config: str
-    image: str | None = None
-    size: str = "10G"
-    btrfs: str | None = None
-    esp: str | None = None
-    upgrade: bool = False
-    rebuild: bool = False
-
-
-@dataclass
-class TestOptions:
-    """Typed options for the test command."""
-    image: str
-    memory: str = "4G"
-    cpus: int = 2
-    graphics: bool = False
 
 
 # =============================================================================
@@ -451,6 +431,8 @@ search --set=root --fs-uuid {root_uuid}
     entries = []
     # Newest first
     for g in sorted(generations, key=lambda x: x.gen, reverse=True):
+        if not g.complete or g.created_at is None:
+            continue
         created_str = datetime.fromtimestamp(g.created_at).strftime("%Y-%m-%d %H:%M")
         entries.append(f"""
 menuentry "Arch Linux (gen-{g.gen}, {created_str})" {{
@@ -528,7 +510,7 @@ class BuildContext:
     mount_root: Path     # Where generation is mounted
     efi_mount: Path      # Where ESP is mounted
     var_path: Path       # Where @var is mounted (or will be mounted)
-    btrfs_dev: str       # Btrfs device path (for mounting @var)
+    btrfs_dev: Path      # Btrfs device path (for mounting @var)
     esp_uuid: str        # UUID of ESP partition
     root_uuid: str       # UUID of btrfs partition
     gen: int = 1         # Generation number
@@ -536,17 +518,18 @@ class BuildContext:
     upgrade: bool = False       # Run pacman -Syu
 
 
-def run(cmd, check=True, capture_output=False) -> str | None:
+def run(cmd, check=True, capture_output=False) -> str:
     """Run a command and optionally capture output."""
-    print(f"Running: {' '.join(cmd)}")
+    cmd_str = ' '.join(str(c) for c in cmd)
+    print(f"Running: {cmd_str}")
     try:
         if capture_output:
             result = subprocess.run(cmd, check=check, capture_output=True, text=True)
             return result.stdout.strip()
-        else:
-            subprocess.run(cmd, check=check)
+        subprocess.run(cmd, check=check)
+        return ""
     except subprocess.CalledProcessError as e:
-        print(f"\nError: Command failed: {' '.join(cmd)}")
+        print(f"\nError: Command failed: {cmd_str}")
         print(f"Exit code: {e.returncode}")
         if e.stderr:
             print(f"stderr:\n{e.stderr}")
@@ -555,7 +538,7 @@ def run(cmd, check=True, capture_output=False) -> str | None:
 
 def chroot_run(root: Path, *cmd, check=True, capture_output=False) -> str | None:
     """Run a command inside a chroot."""
-    return run(["arch-chroot", str(root)] + list(cmd), check=check, capture_output=capture_output)
+    return run(["arch-chroot", root] + list(cmd), check=check, capture_output=capture_output)
 
 
 def fix_owner(path: Path):
@@ -622,14 +605,14 @@ def build_generation(config: Config, ctx: BuildContext):
     # On non-darch host: uses host cache. On darch system: uses @var cache.
     gen_cache = ctx.mount_root / "var" / "cache" / "pacman" / "pkg"
     gen_cache.mkdir(parents=True, exist_ok=True)
-    with mount("/var/cache/pacman/pkg", gen_cache, bind=True):
-        run(["pacstrap", "-K", str(ctx.mount_root)] + sorted(config.packages))
+    with mount(Path("/var/cache/pacman/pkg"), gen_cache, bind=True):
+        run(["pacstrap", "-K", ctx.mount_root] + sorted(config.packages))
 
     print("\n=== Relocating pacman state to /pacman ===")
     pacman_src = ctx.mount_root / "var" / "lib" / "pacman"
     pacman_dst = ctx.mount_root / "pacman"
     if pacman_src.exists():
-        shutil.move(str(pacman_src), str(pacman_dst))
+        shutil.move(pacman_src, pacman_dst)
         print(f"  Moved {pacman_src} -> {pacman_dst}")
 
     print("\n=== Creating /current -> . symlink (for build-time pacman access) ===")
@@ -761,44 +744,43 @@ def lockfile():
 
 
 @contextmanager
-def loop_device(image_path: str):
+def loop_device(image_path: Path) -> Iterator[Tuple[Path, Path]]:
     """Loop-mount a disk image, yield (esp_part, btrfs_part)."""
     loop = run(["losetup", "-Pf", "--show", image_path], capture_output=True)
     run(["udevadm", "settle"])
     try:
-        yield f"{loop}p1", f"{loop}p2"  # esp, btrfs
+        yield Path(f"{loop}p1"), Path(f"{loop}p2")  # esp, btrfs
     finally:
         run(["sync"])
         run(["losetup", "-d", loop], check=False)
 
 
 @contextmanager
-def mount(device: str, mount_point: Path, options: str | None = None, bind: bool = False):
+def mount(device: Path, mount_point: Path, options: str | None = None, bind: bool = False) -> Iterator[Path]:
     """Mount a filesystem, yield mount point as Path."""
     mount_point.mkdir(parents=True, exist_ok=True)
     # Ensure not already mounted from a previous failed run
-    run(["umount", str(mount_point)], check=False)
-    cmd = ["mount"]
+    run(["umount", mount_point], check=False)
+    cmd: list[str | Path] = ["mount"]
     if bind:
         cmd.append("--bind")
     if options:
         cmd.extend(["-o", options])
-    cmd.extend([device, str(mount_point)])
+    cmd.extend([device, mount_point])
     run(cmd)
     try:
         yield mount_point
     finally:
         # Sync to flush writes, then unmount properly
         run(["sync"])
-        run(["umount", str(mount_point)], check=False)
+        run(["umount", mount_point], check=False)
 
 
 @contextmanager
-def image_file(image_path: str, size: str = "10G"):
+def image_file(image_path: Path, size: str = "10G") -> Iterator[Tuple[Path, Path]]:
     """Create a blank disk image with ESP and btrfs partitions + subvolumes."""
 
-    image = Path(image_path)
-    if image.exists():
+    if image_path.exists():
         print(f"=== Disk image exists: {image_path} ===")
         with loop_device(image_path) as result:
             yield result
@@ -820,17 +802,17 @@ def image_file(image_path: str, size: str = "10G"):
             print("\n=== Creating btrfs subvolumes ===")
             mount_point = Path("/mnt/darch-setup")
             mount_point.mkdir(parents=True, exist_ok=True)
-            run(["mount", root_part, str(mount_point)])
+            run(["mount", root_part, mount_point])
 
-            run(["btrfs", "subvol", "create", str(mount_point / "@images")])
-            run(["btrfs", "subvol", "create", str(mount_point / "@var")])
-            run(["btrfs", "subvol", "create", str(mount_point / "@home")])
+            run(["btrfs", "subvol", "create", mount_point / "@images"])
+            run(["btrfs", "subvol", "create", mount_point / "@var"])
+            run(["btrfs", "subvol", "create", mount_point / "@home"])
 
             (mount_point / "@home/root").mkdir(mode=0o700, parents=True, exist_ok=True)
             (mount_point / "@var/lib/machines").mkdir(parents=True, exist_ok=True)
 
-            run(["umount", str(mount_point)])
-            fix_owner(image)
+            run(["umount", mount_point])
+            fix_owner(image_path)
             print("\n=== Image created successfully ===")
             yield esp_part, root_part
 
@@ -861,7 +843,7 @@ def get_generations(images: Path) -> list[GenerationInfo]:
     return sorted(result, key=lambda g: g.gen)
 
 
-def garbage_collect_generations(images: Path) -> list[int]:
+def garbage_collect_generations(images: Path):
     """Delete incomplete and old generations based on GC settings.
 
     Policy:
@@ -874,27 +856,27 @@ def garbage_collect_generations(images: Path) -> list[int]:
     Returns list of deleted generation numbers.
     """
     now = time.time()
-    deleted = []
     gens = get_generations(images)
 
     # First pass: delete all incomplete generations
     for g in gens:
         if not g.complete:
             print(f"Deleting incomplete gen-{g.gen}")
-            run(["btrfs", "subvol", "delete", str(g.path)])
-            deleted.append(g.gen)
+            run(["btrfs", "subvol", "delete", g.path])
 
     # Second pass: GC old complete generations
     complete = [g for g in gens if g.complete]
     if len(complete) <= GC_KEEP_MIN:
-        return deleted
+        return
 
     # Sort by gen number (oldest first) for deletion candidates
     complete_sorted = sorted(complete, key=lambda g: g.gen)
-    complete_deleted = []
+    complete_deleted = 0
 
     for g in complete_sorted:
-        remaining = len(complete) - len(complete_deleted)
+        if not g.complete or g.created_at is None:
+            continue
+        remaining = len(complete) - complete_deleted
 
         # Stop if we're at minimum
         if remaining <= GC_KEEP_MIN:
@@ -909,17 +891,15 @@ def garbage_collect_generations(images: Path) -> list[int]:
         # Delete if over max age
         if GC_MAX_AGE_DAYS > 0 and age_days > GC_MAX_AGE_DAYS:
             print(f"Deleting old gen-{g.gen} (age: {age_days:.0f} days)")
-            run(["btrfs", "subvol", "delete", str(g.path)])
-            complete_deleted.append(g.gen)
+            run(["btrfs", "subvol", "delete", g.path])
+            complete_deleted += 1
             continue
 
         # Delete if over max count
         if GC_KEEP_MAX > 0 and remaining > GC_KEEP_MAX:
             print(f"Deleting excess gen-{g.gen} (count: {remaining} > {GC_KEEP_MAX})")
-            run(["btrfs", "subvol", "delete", str(g.path)])
-            complete_deleted.append(g.gen)
-
-    return deleted + complete_deleted
+            run(["btrfs", "subvol", "delete", g.path])
+            complete_deleted += 1
 
 
 def create_gen_subvol(images: Path, gen: int, snapshot_from: int | None = None):
@@ -928,14 +908,14 @@ def create_gen_subvol(images: Path, gen: int, snapshot_from: int | None = None):
     # Delete existing subvolume if present (e.g., from failed build)
     if target.exists():
         print(f"Deleting existing gen-{gen}")
-        run(["btrfs", "subvol", "delete", str(target)])
+        run(["btrfs", "subvol", "delete", target])
     if snapshot_from is not None:
         source = images / f"gen-{snapshot_from}"
         print(f"Creating gen-{gen} as snapshot of gen-{snapshot_from}")
-        run(["btrfs", "subvol", "snapshot", str(source), str(target)])
+        run(["btrfs", "subvol", "snapshot", source, target])
     else:
         print(f"Creating gen-{gen}")
-        run(["btrfs", "subvol", "create", str(target)])
+        run(["btrfs", "subvol", "create", target])
 
 
 def load_gen_config(gen_path: Path) -> Config | None:
@@ -946,9 +926,12 @@ def load_gen_config(gen_path: Path) -> Config | None:
     return Config.from_json(config_file.read_text())
 
 
-def load_config_module(config_path: str) -> Config:
+def load_config_module(config_path: Path) -> Config | None:
     """Load config.py and call configure()."""
     spec = importlib.util.spec_from_file_location("config", config_path)
+    if spec is None or spec.loader is None:
+        return None
+        
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     config = module.configure()
@@ -960,20 +943,31 @@ def load_config_module(config_path: str) -> Config:
     return config
 
 
-def apply_configuration(opts: ApplyOptions) -> str:
+def apply_configuration(
+    config_path: Path,
+    image_path: Path | None,
+    image_size: str,
+    btrfs_dev: Path | None,
+    esp_dev: Path | None,
+    upgrade: bool,
+    rebuild: bool,
+) -> int:
     """Applies the provided config to the system found in 'image' or 'btrfs'/'esp'"""
-    if not opts.image and not (opts.btrfs and opts.esp):
-        print("Error: --image or (--btrfs and --esp) required")
-        return 1
-
     with ExitStack() as stack:
         stack.enter_context(lockfile())
-        config = load_config_module(opts.config)
+        config = load_config_module(config_path)
+        if config is None:
+            print("Error: Could not load configuration.")
+            return 1
 
-        if opts.image:
-            esp_dev, btrfs_dev = stack.enter_context(image_file(opts.image, opts.size))
-        else:
-            esp_dev, btrfs_dev = (opts.esp, opts.btrfs)
+        if image_path:
+            if btrfs_dev is not None or esp_dev is not None:
+                print("Error: --btrfs and --esp not supported in combination with --image")
+                return 1
+            esp_dev, btrfs_dev = stack.enter_context(image_file(image_path, image_size))
+        elif btrfs_dev is None or esp_dev is None:
+            print("Error: --image or (--btrfs and --esp) required")
+            return 1
 
         images = stack.enter_context(mount(btrfs_dev, Path("/mnt/darch-images"), "subvol=@images"))
 
@@ -991,7 +985,7 @@ def apply_configuration(opts: ApplyOptions) -> str:
         root_uuid = run(["blkid", "-s", "UUID", "-o", "value", btrfs_dev], capture_output=True)
         config.add_file("/etc/fstab", generate_fstab(esp_uuid))
 
-        fresh = current is None or opts.rebuild
+        fresh = current is None or rebuild
         diff = None
         if not fresh:
             # Check for changes before creating new generation
@@ -1002,7 +996,7 @@ def apply_configuration(opts: ApplyOptions) -> str:
                     fresh = True
                 else:
                     diff = ConfigDiff.compute(old_config, config)
-                    if not diff.has_changes() and not (opts.upgrade and check_upgrades_available(old_gen)):
+                    if not diff.has_changes() and not (upgrade and check_upgrades_available(old_gen)):
                         print("Already up to date.")
                         return 0
 
@@ -1022,7 +1016,7 @@ def apply_configuration(opts: ApplyOptions) -> str:
             root_uuid=root_uuid,
             gen=new_gen,
             fresh_install=fresh,
-            upgrade=opts.upgrade,
+            upgrade=upgrade,
         )
 
         if fresh:
@@ -1034,6 +1028,7 @@ def apply_configuration(opts: ApplyOptions) -> str:
             if old_config_file.exists():
                 old_config_file.rename(mount_root / "config.json.prev")
 
+            assert diff is not None
             build_incremental(diff, ctx)
 
         # Configure declarative user if specified
@@ -1067,17 +1062,21 @@ def find_ovmf() -> tuple[Path, Path] | None:
         ("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"),
         ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
     ]
-    for code, vars in ovmf_paths:
-        if Path(code).exists() and Path(vars).exists():
-            return Path(code), Path(vars)
+    for code_file, vars_file in ovmf_paths:
+        if Path(code_file).exists() and Path(vars_file).exists():
+            return Path(code_file), Path(vars_file)
     return None
 
 
-def test_image(opts: TestOptions) -> int:
+def test_image(
+    image_path: Path,
+    memory: str,
+    cpus: int,
+    graphics: bool,
+) -> int:
     """Boot an image in QEMU for testing."""
-    image = Path(opts.image)
-    if not image.exists():
-        print(f"Error: Image file '{opts.image}' not found")
+    if not image_path.exists():
+        print(f"Error: Image file '{image_path}' not found")
         return 1
 
     if not shutil.which("qemu-system-x86_64"):
@@ -1092,9 +1091,9 @@ def test_image(opts: TestOptions) -> int:
         return 1
 
     ovmf_code, ovmf_vars = ovmf
-    print(f"Starting QEMU with image: {opts.image}")
+    print(f"Starting QEMU with image: {image_path}")
     print(f"OVMF: {ovmf_code}")
-    print(f"Mode: {'graphics' if opts.graphics else 'serial console'}")
+    print(f"Mode: {'graphics' if graphics else 'serial console'}")
 
     # Create a temporary copy of OVMF_VARS (it's writable)
     vars_copy = tempfile.NamedTemporaryFile(delete=False)
@@ -1105,17 +1104,17 @@ def test_image(opts: TestOptions) -> int:
         "qemu-system-x86_64",
         "-enable-kvm",
         "-cpu", "host",
-        "-m", opts.memory,
-        "-smp", str(opts.cpus),
+        "-m", memory,
+        "-smp", str(cpus),
         "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
         "-drive", f"if=pflash,format=raw,file={vars_copy.name}",
-        "-drive", f"file={opts.image},format=raw",
+        "-drive", f"file={image_path},format=raw",
         "-net", "none",
         "-usb",
         "-device", "usb-tablet",
     ]
 
-    if opts.graphics:
+    if graphics:
         # Virtio GPU with OpenGL acceleration
         cmd += [
             "-device", "virtio-vga",
@@ -1152,19 +1151,24 @@ def main() -> int:
     )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
+    def path_type(value: str | None) -> Path | None:
+        if value is None:
+            return None
+        return Path(value)
+
     # apply command
     p_apply = subparsers.add_parser("apply", help="Apply configuration (auto-detects fresh vs incremental)")
-    p_apply.add_argument("--image", help="Path to disk image")
+    p_apply.add_argument("--config", default="./config.py", help="Path to config.py", type=path_type)
+    p_apply.add_argument("--image", help="Path to disk image", type=path_type)
     p_apply.add_argument("--size", default="10G", help="Image size (default: 10G)")
-    p_apply.add_argument("--btrfs", help="Btrfs device (e.g., /dev/nvme0n1p2)")
-    p_apply.add_argument("--esp", help="ESP device (e.g., /dev/nvme0n1p1)")
-    p_apply.add_argument("--config", default="./config.py", help="Path to config.py")
+    p_apply.add_argument("--btrfs", help="Btrfs device (e.g., /dev/nvme0n1p2)", type=path_type)
+    p_apply.add_argument("--esp", help="ESP device (e.g., /dev/nvme0n1p1)", type=path_type)
     p_apply.add_argument("--upgrade", action="store_true", help="Also upgrade all packages (pacman -Syu)")
     p_apply.add_argument("--rebuild", action="store_true", help="Force fresh build even if generations exist")
 
     # test command
     p_test = subparsers.add_parser("test", help="Boot an image in QEMU for testing")
-    p_test.add_argument("image", help="Path to disk image")
+    p_test.add_argument("image", help="Path to disk image", type=path_type)
     p_test.add_argument("--memory", default="4G", help="VM memory (default: 4G)")
     p_test.add_argument("--cpus", type=int, default=2, help="Number of CPUs (default: 2)")
     p_test.add_argument("--graphics", action="store_true", help="Enable graphical display (virtio-gpu)")
@@ -1172,12 +1176,12 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "test":
-        return test_image(TestOptions(
-            image=args.image,
-            memory=args.memory,
-            cpus=args.cpus,
-            graphics=args.graphics,
-        ))
+        return test_image(
+            image_path = args.image,
+            memory = args.memory,
+            cpus = args.cpus,
+            graphics = args.graphics,
+        )
 
     # Commands below require root
     if os.geteuid() != 0:
@@ -1185,15 +1189,15 @@ def main() -> int:
         return 1
 
     if args.command == "apply":
-        return apply_configuration(ApplyOptions(
-            config=args.config,
-            image=args.image,
-            size=args.size,
-            btrfs=args.btrfs,
-            esp=args.esp,
-            upgrade=args.upgrade,
-            rebuild=args.rebuild,
-        ))
+        return apply_configuration(
+            config_path = args.config,
+            image_path = args.image,
+            image_size = args.size,
+            btrfs_dev = args.btrfs,
+            esp_dev = args.esp,
+            upgrade = args.upgrade,
+            rebuild = args.rebuild,
+        )
 
     parser.print_help()
     return 1
