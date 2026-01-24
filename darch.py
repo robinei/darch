@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Set, Dict, Tuple, Literal
 import argparse
 import fcntl
+import importlib.util
 import json
 import os
 import re
@@ -40,6 +41,39 @@ GC_MAX_AGE_DAYS = 30     # Delete generations older than this (0 = keep forever)
 
 FileEntry = Tuple[Literal['file'], str, int | None]  # ('file', content, mode)
 SymlinkEntry = Tuple[Literal['symlink'], str]         # ('symlink', target)
+
+
+@dataclass
+class ConfigDiff:
+    """Differences between two configs."""
+    packages_to_install: Set[str]
+    packages_to_remove: Set[str]
+    files_to_add: Dict[str, FileEntry | SymlinkEntry]
+    files_to_remove: Dict[str, FileEntry | SymlinkEntry]
+    files_to_update: Dict[str, FileEntry | SymlinkEntry]
+
+    @classmethod
+    def compute(cls, old: Config, new: Config) -> "ConfigDiff":
+        """Compare two configs and return the differences."""
+        return cls(
+            packages_to_install=new.packages - old.packages,
+            packages_to_remove=old.packages - new.packages,
+            files_to_add={p: e for p, e in new.files.items() if p not in old.files},
+            files_to_remove={p: e for p, e in old.files.items() if p not in new.files},
+            files_to_update={p: e for p, e in new.files.items()
+                             if p in old.files and old.files[p] != e},
+        )
+
+    def has_changes(self) -> bool:
+        """Check if this diff has any changes."""
+        return bool(
+            self.packages_to_install or
+            self.packages_to_remove or
+            self.files_to_add or
+            self.files_to_remove or
+            self.files_to_update
+        )
+
 
 @dataclass
 class Config:
@@ -190,6 +224,18 @@ class GenerationInfo:
     path: Path
     complete: bool              # True if config.json exists
     created_at: float | None    # Unix timestamp (None if incomplete)
+
+
+@dataclass
+class ApplyOptions:
+    """Typed options for the apply command."""
+    config: str
+    image: str | None = None
+    size: str = "10G"
+    btrfs: str | None = None
+    esp: str | None = None
+    upgrade: bool = False
+    rebuild: bool = False
 
 
 # =============================================================================
@@ -459,6 +505,15 @@ def setup_var_pacman_symlink(var_path: Path):
     force_symlink(pacman_link, "../../../current/pacman")
 
 
+def check_upgrades_available(mount_root: Path) -> bool:
+    """Check if package upgrades are available."""
+    try:
+        chroot_run(mount_root, "checkupdates", capture_output=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
 def build_generation(config: Config, ctx: BuildContext):
     """
     Build a generation from config into the mounted filesystem.
@@ -547,48 +602,7 @@ def build_generation(config: Config, ctx: BuildContext):
         force_symlink(ctx.mount_root / "etc/mtab", "/proc/mounts")
 
 
-@dataclass
-class ConfigDiff:
-    """Differences between two configs."""
-    packages_to_install: Set[str]
-    packages_to_remove: Set[str]
-    files_to_add: Dict[str, FileEntry | SymlinkEntry]
-    files_to_remove: Dict[str, FileEntry | SymlinkEntry]
-    files_to_update: Dict[str, FileEntry | SymlinkEntry]
-
-    @classmethod
-    def compute(cls, old: Config, new: Config) -> "ConfigDiff":
-        """Compare two configs and return the differences."""
-        return cls(
-            packages_to_install=new.packages - old.packages,
-            packages_to_remove=old.packages - new.packages,
-            files_to_add={p: e for p, e in new.files.items() if p not in old.files},
-            files_to_remove={p: e for p, e in old.files.items() if p not in new.files},
-            files_to_update={p: e for p, e in new.files.items()
-                             if p in old.files and old.files[p] != e},
-        )
-
-    def has_changes(self) -> bool:
-        """Check if this diff has any changes."""
-        return bool(
-            self.packages_to_install or
-            self.packages_to_remove or
-            self.files_to_add or
-            self.files_to_remove or
-            self.files_to_update
-        )
-
-
-def check_upgrades_available(mount_root: Path) -> bool:
-    """Check if package upgrades are available."""
-    try:
-        chroot_run(mount_root, "checkupdates", capture_output=True)
-        return True
-    except subprocess.CalledProcessError:
-        return False
-
-
-def build_incremental(config: Config, ctx: BuildContext, diff: ConfigDiff):
+def build_incremental(diff: ConfigDiff, ctx: BuildContext):
     """
     Build a new generation incrementally from an existing one.
 
@@ -650,7 +664,7 @@ def build_incremental(config: Config, ctx: BuildContext, diff: ConfigDiff):
 def lockfile():
     """Acquire exclusive lock to prevent concurrent darch runs."""
     LOCKFILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(LOCKFILE, "w") as f:
+    with open(LOCKFILE, "w", encoding='utf-8') as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -850,7 +864,6 @@ def load_gen_config(gen_path: Path) -> Config | None:
 
 def load_config_module(config_path: str) -> Config:
     """Load config.py and call configure()."""
-    import importlib.util
     spec = importlib.util.spec_from_file_location("config", config_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -863,7 +876,99 @@ def load_config_module(config_path: str) -> Config:
     return config
 
 
-def main():
+def apply_configuration(opts: ApplyOptions) -> str:
+    """Applies the provided config to the system found in 'image' or 'btrfs'/'esp'"""
+    if not opts.image and not (opts.btrfs and opts.esp):
+        print("Error: --image or (--btrfs and --esp) required")
+        return 1
+
+    with ExitStack() as stack:
+        stack.enter_context(lockfile())
+        config = load_config_module(opts.config)
+
+        if opts.image:
+            esp_dev, btrfs_dev = stack.enter_context(image_file(opts.image, opts.size))
+        else:
+            esp_dev, btrfs_dev = (opts.esp, opts.btrfs)
+
+        images = stack.enter_context(mount(btrfs_dev, Path("/mnt/darch-images"), "subvol=@images"))
+
+        # Clean up incomplete generations from failed builds
+        garbage_collect_generations(images)
+
+        # Find current complete generation
+        gens = get_generations(images)
+        complete_gens = [g for g in gens if g.complete]
+        current = complete_gens[-1].gen if complete_gens else None
+        new_gen = (current or 0) + 1
+
+        # Get UUIDs and add runtime-dependent files before diffing
+        esp_uuid = run(["blkid", "-s", "UUID", "-o", "value", esp_dev], capture_output=True)
+        root_uuid = run(["blkid", "-s", "UUID", "-o", "value", btrfs_dev], capture_output=True)
+        config.add_file("/etc/fstab", generate_fstab(esp_uuid))
+
+        fresh = current is None or opts.rebuild
+        diff = None
+        if not fresh:
+            # Check for changes before creating new generation
+            with mount(btrfs_dev, Path("/mnt/darch-old"), f"subvol=@images/gen-{current}") as old_gen:
+                old_config = load_gen_config(old_gen)
+                if old_config is None:
+                    print(f"gen-{current} has no config.json, forcing rebuild")
+                    fresh = True
+                else:
+                    diff = ConfigDiff.compute(old_config, config)
+                    if not diff.has_changes() and not (opts.upgrade and check_upgrades_available(old_gen)):
+                        print("Already up to date.")
+                        return 0
+
+        # Create and mount new generation
+        create_gen_subvol(images, new_gen, snapshot_from=None if fresh else current)
+        mount_root = Path("/mnt/darch-build")
+        stack.enter_context(mount(btrfs_dev, mount_root, f"subvol=@images/gen-{new_gen}"))
+        stack.enter_context(mount(esp_dev, mount_root / "efi"))
+        # Note: @var is mounted by builder functions, not here
+
+        ctx = BuildContext(
+            mount_root=mount_root,
+            efi_mount=mount_root / "efi",
+            var_path=mount_root / "var",
+            btrfs_dev=btrfs_dev,
+            esp_uuid=esp_uuid,
+            root_uuid=root_uuid,
+            gen=new_gen,
+            fresh_install=fresh,
+            upgrade=opts.upgrade,
+        )
+
+        if fresh:
+            build_generation(config, ctx)
+        else:
+            # For incremental builds, invalidate inherited config.json so a failed
+            # build is clearly incomplete. Rename to .prev for debugging.
+            old_config_file = mount_root / "config.json"
+            if old_config_file.exists():
+                old_config_file.rename(mount_root / "config.json.prev")
+
+            build_incremental(diff, ctx)
+
+        # Save config
+        print("\n=== Saving config ===")
+        (ctx.mount_root / "config.json").write_text(config.to_json())
+
+        # Write GRUB config with all complete generations
+        print("\n=== Writing GRUB config ===")
+        complete_gens = [g for g in get_generations(images) if g.complete]
+        grub_cfg = ctx.efi_mount / "grub" / "grub.cfg"
+        grub_cfg.parent.mkdir(parents=True, exist_ok=True)
+        grub_cfg.write_text(generate_grub_config(ctx.root_uuid, complete_gens))
+
+        print(f"\n=== SUCCESS: Built gen-{new_gen} ===")
+    return 0
+
+
+def main() -> int:
+    """Darch entry point."""
     parser = argparse.ArgumentParser(
         description="darch - Declarative Arch Linux image builder",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -887,102 +992,19 @@ def main():
         return 1
 
     if args.command == "apply":
-        if not args.image and not (args.btrfs and args.esp):
-            print("Error: --image or (--btrfs and --esp) required")
-            return 1
+        return apply_configuration(ApplyOptions(
+            config=args.config,
+            image=args.image,
+            size=args.size,
+            btrfs=args.btrfs,
+            esp=args.esp,
+            upgrade=args.upgrade,
+            rebuild=args.rebuild,
+        ))
 
-        with ExitStack() as stack:
-            stack.enter_context(lockfile())
-            config = load_config_module(args.config)
-
-            if args.image:
-                esp_dev, btrfs_dev = stack.enter_context(image_file(args.image, args.size))
-            else:
-                esp_dev, btrfs_dev = (args.esp, args.btrfs)
-
-            images = stack.enter_context(mount(btrfs_dev, Path("/mnt/darch-images"), "subvol=@images"))
-
-            # Clean up incomplete generations from failed builds
-            garbage_collect_generations(images)
-
-            # Find current complete generation
-            gens = get_generations(images)
-            complete_gens = [g for g in gens if g.complete]
-            current = complete_gens[-1].gen if complete_gens else None
-            new_gen = (current or 0) + 1
-
-            # Get UUIDs and add runtime-dependent files before diffing
-            esp_uuid = run(["blkid", "-s", "UUID", "-o", "value", esp_dev], capture_output=True)
-            root_uuid = run(["blkid", "-s", "UUID", "-o", "value", btrfs_dev], capture_output=True)
-            config.add_file("/etc/fstab", generate_fstab(esp_uuid))
-
-            fresh = current is None or args.rebuild
-            diff = None
-            if not fresh:
-                # Check for changes before creating new generation
-                old_gen = stack.enter_context(
-                    mount(btrfs_dev, Path("/mnt/darch-old"), f"subvol=@images/gen-{current}"))
-                old_config = load_gen_config(old_gen)
-
-                if old_config is None:
-                    print(f"gen-{current} has no config.json, forcing rebuild")
-                    fresh = True
-                else:
-                    diff = ConfigDiff.compute(old_config, config)
-
-                    if not diff.has_changes() and not (args.upgrade and check_upgrades_available(old_gen)):
-                        print("Already up to date.")
-                        return 0
-
-            # Create and mount new generation
-            create_gen_subvol(images, new_gen, snapshot_from=None if fresh else current)
-            mount_root = Path("/mnt/darch-build")
-            stack.enter_context(mount(btrfs_dev, mount_root, f"subvol=@images/gen-{new_gen}"))
-            stack.enter_context(mount(esp_dev, mount_root / "efi"))
-            # Note: @var is mounted by builder functions, not here
-
-            # For incremental builds, invalidate inherited config.json so a failed
-            # build is clearly incomplete. Rename to .prev for debugging.
-            if not fresh:
-                old_config_file = mount_root / "config.json"
-                if old_config_file.exists():
-                    old_config_file.rename(mount_root / "config.json.prev")
-
-            ctx = BuildContext(
-                mount_root=mount_root,
-                efi_mount=mount_root / "efi",
-                var_path=mount_root / "var",
-                btrfs_dev=btrfs_dev,
-                esp_uuid=esp_uuid,
-                root_uuid=root_uuid,
-                gen=new_gen,
-                fresh_install=fresh,
-                upgrade=args.upgrade,
-            )
-
-            if fresh:
-                build_generation(config, ctx)
-            else:
-                build_incremental(config, ctx, diff)
-
-            # Save config
-            print("\n=== Saving config ===")
-            (ctx.mount_root / "config.json").write_text(config.to_json())
-
-            # Write GRUB config with all complete generations
-            print("\n=== Writing GRUB config ===")
-            complete_gens = [g for g in get_generations(images) if g.complete]
-            grub_cfg = ctx.efi_mount / "grub" / "grub.cfg"
-            grub_cfg.parent.mkdir(parents=True, exist_ok=True)
-            grub_cfg.write_text(generate_grub_config(ctx.root_uuid, complete_gens))
-
-            print(f"\n=== SUCCESS: Built gen-{new_gen} ===")
-
-    else:
-        parser.print_help()
-        return 1
+    parser.print_help()
+    return 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
