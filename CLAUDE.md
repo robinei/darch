@@ -139,3 +139,34 @@ darch adds its own files (mkinitcpio.conf, initramfs hooks, fstab) before buildi
 ## GRUB
 
 GRUB config lists all generations with creation timestamps, newest first. Each entry loads the kernel directly from the btrfs subvolume with the generation number as a kernel parameter.
+
+## Transactional Builds
+
+`config.json` serves as the completion marker:
+- Written only at end of successful build
+- Incomplete generations (no config.json) are garbage collected on next run
+- For incremental builds, inherited config.json is renamed to `.prev` at start
+- GRUB config only includes complete generations
+
+## Garbage Collection
+
+Controlled by constants at top of `darch.py`:
+- `GC_KEEP_MIN` (default 3): Always keep at least this many generations
+- `GC_KEEP_MAX` (default 10): Delete oldest if exceeding this count
+- `GC_MIN_AGE_DAYS` (default 7): Never delete generations younger than this
+- `GC_MAX_AGE_DAYS` (default 30): Delete generations older than this
+
+Incomplete generations are always deleted. Complete generations are pruned by age/count.
+
+## Concurrency
+
+A lockfile (`/var/lock/darch.lock`) prevents concurrent builds.
+
+## Design Assumptions
+
+- **btrfs required**: Relies on subvolumes and snapshots
+- **EFI boot only**: No legacy BIOS support
+- **Single btrfs partition**: All subvolumes on same filesystem
+- **systemd required**: Initramfs hands off to systemd
+- **systemd-resolved for DNS**: resolv.conf symlinks to stub-resolv.conf (override via config if needed)
+- **Serial console in GRUB**: Configured for QEMU; modify for physical hardware
