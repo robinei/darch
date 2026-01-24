@@ -24,13 +24,13 @@ def configure() -> Config:
     # System settings
     config.set_hostname("archvm")
     config.set_timezone("UTC")
-    config.set_locale("en_US.UTF-8")
-    config.set_keymap("us")
+    config.set_locales("en_US.UTF-8", "nb_NO.UTF-8")
+    config.set_keymap("no")
 
     # User
     config.user = User("robin",
-        groups={"wheel"},
-        password_hash="$6$bxSIgU/AEruP0HSu$UCk/mosb6FkwuJ556RZn.CHQy1Ys4cFmFVikf5a5QvTo4EO8HGXLFvRHLJdE.QMjFptVAqY/EzwVkYjA7vwwX1",
+        groups = {"wheel"},
+        password_hash = "$6$bxSIgU/AEruP0HSu$UCk/mosb6FkwuJ556RZn.CHQy1Ys4cFmFVikf5a5QvTo4EO8HGXLFvRHLJdE.QMjFptVAqY/EzwVkYjA7vwwX1",
     )
 
     # Packages

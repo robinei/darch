@@ -91,10 +91,13 @@ class ConfigDiff:
     files_to_add: Dict[str, FileEntry | SymlinkEntry]
     files_to_remove: Dict[str, FileEntry | SymlinkEntry]
     files_to_update: Dict[str, FileEntry | SymlinkEntry]
+    user_changed: bool
 
     @classmethod
     def compute(cls, old: Config, new: Config) -> ConfigDiff:
         """Compare two configs and return the differences."""
+        old_user = json.dumps(old.user.to_dict(), sort_keys=True) if old.user else None
+        new_user = json.dumps(new.user.to_dict(), sort_keys=True) if new.user else None
         return cls(
             packages_to_install=new.packages - old.packages,
             packages_to_remove=old.packages - new.packages,
@@ -102,6 +105,7 @@ class ConfigDiff:
             files_to_remove={p: e for p, e in old.files.items() if p not in new.files},
             files_to_update={p: e for p, e in new.files.items()
                              if p in old.files and old.files[p] != e},
+            user_changed=old_user != new_user,
         )
 
     def has_changes(self) -> bool:
@@ -111,7 +115,8 @@ class ConfigDiff:
             self.packages_to_remove or
             self.files_to_add or
             self.files_to_remove or
-            self.files_to_update
+            self.files_to_update or
+            self.user_changed
         )
 
 
@@ -177,9 +182,12 @@ class Config:
         """Set system timezone."""
         return self.add_symlink("/etc/localtime", f"/usr/share/zoneinfo/{tz}")
 
-    def set_locale(self, locale: str) -> Config:
+    def set_locales(self, locale: str, *extra_gen: list[str]) -> Config:
         """Set system locale."""
-        self.add_file("/etc/locale.gen", f"{locale} UTF-8\n")
+        gen_lines = [f"{locale} UTF-8"]
+        for extra in extra_gen:
+            gen_lines.append(f"{extra} UTF-8")
+        self.add_file("/etc/locale.gen", '\n'.join(gen_lines))
         return self.add_file("/etc/locale.conf", f"LANG={locale}\n")
 
     def set_keymap(self, keymap: str) -> Config:
@@ -472,6 +480,28 @@ def configure_user(user: User, gen_root: Path, home_path: Path):
     group_lines.append(f"{user.name}:x:{user.uid}:")
     gshadow_lines.append(f"{user.name}:!::")
 
+    # Find existing group names and max GID for creating new groups
+    existing_groups = set()
+    max_gid = 999  # Start user groups at 1000+
+    for line in group_lines:
+        parts = line.split(":")
+        if len(parts) >= 3:
+            existing_groups.add(parts[0])
+            try:
+                gid = int(parts[2])
+                if gid > max_gid:
+                    max_gid = gid
+            except ValueError:
+                pass
+
+    # Create missing groups
+    for group_name in sorted(user.groups):
+        if group_name not in existing_groups:
+            max_gid += 1
+            group_lines.append(f"{group_name}:x:{max_gid}:")
+            gshadow_lines.append(f"{group_name}:!::")
+            print(f"  Created group: {group_name} (gid={max_gid})")
+
     # Add user to supplementary groups
     new_group_lines = []
     for line in group_lines:
@@ -712,6 +742,11 @@ def build_incremental(diff: ConfigDiff, ctx: BuildContext):
                 if full_path.exists() or full_path.is_symlink():
                     full_path.unlink()
                     print(f"  removed: {path}")
+
+        # Regenerate locale if locale.gen changed
+        if "/etc/locale.gen" in all_file_changes:
+            print("\n=== Regenerating locales ===")
+            chroot_run(ctx.mount_root, "locale-gen")
 
         # Check if initramfs needs regeneration
         initramfs_paths = {"/etc/mkinitcpio.conf", "/usr/lib/initcpio/hooks/darch",
