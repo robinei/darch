@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -236,6 +237,14 @@ class ApplyOptions:
     esp: str | None = None
     upgrade: bool = False
     rebuild: bool = False
+
+
+@dataclass
+class TestOptions:
+    """Typed options for the test command."""
+    image: str
+    memory: str = "4G"
+    cpus: int = 2
 
 
 # =============================================================================
@@ -471,6 +480,14 @@ def run(cmd, check=True, capture_output=False) -> str | None:
 def chroot_run(root: Path, *cmd, check=True, capture_output=False) -> str | None:
     """Run a command inside a chroot."""
     return run(["arch-chroot", str(root)] + list(cmd), check=check, capture_output=capture_output)
+
+
+def fix_owner(path: Path):
+    """Fix ownership of a file to the invoking user (when run via sudo)."""
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if uid and gid:
+        os.chown(path, int(uid), int(gid))
 
 
 def write_file_entry(path: Path, entry: FileEntry | SymlinkEntry):
@@ -747,6 +764,7 @@ def image_file(image_path: str, size: str = "10G"):
             (mount_point / "@var/lib/machines").mkdir(parents=True, exist_ok=True)
 
             run(["umount", str(mount_point)])
+            fix_owner(image)
             print("\n=== Image created successfully ===")
             yield esp_part, root_part
 
@@ -967,6 +985,73 @@ def apply_configuration(opts: ApplyOptions) -> str:
     return 0
 
 
+def find_ovmf() -> tuple[Path, Path] | None:
+    """Find OVMF firmware files for UEFI boot."""
+    ovmf_paths = [
+        ("/usr/share/edk2-ovmf/x64/OVMF_CODE.4m.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.4m.fd"),
+        ("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"),
+        ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+    ]
+    for code, vars in ovmf_paths:
+        if Path(code).exists() and Path(vars).exists():
+            return Path(code), Path(vars)
+    return None
+
+
+def test_image(opts: TestOptions) -> int:
+    """Boot an image in QEMU for testing."""
+    image = Path(opts.image)
+    if not image.exists():
+        print(f"Error: Image file '{opts.image}' not found")
+        return 1
+
+    if not shutil.which("qemu-system-x86_64"):
+        print("Error: qemu-system-x86_64 not found")
+        print("Install with: sudo pacman -S qemu-full")
+        return 1
+
+    ovmf = find_ovmf()
+    if not ovmf:
+        print("Error: OVMF firmware not found")
+        print("Install with: sudo pacman -S edk2-ovmf")
+        return 1
+
+    ovmf_code, ovmf_vars = ovmf
+    print(f"Starting QEMU with image: {opts.image}")
+    print(f"OVMF: {ovmf_code}")
+
+    # Create a temporary copy of OVMF_VARS (it's writable)
+    vars_copy = tempfile.NamedTemporaryFile(delete=False)
+    vars_copy.write(ovmf_vars.read_bytes())
+    vars_copy.close()
+
+    logfile = Path("qemu-console.log")
+    print(f"Logging console output to: {logfile}")
+    print("Exit with: Ctrl-A X")
+    print()
+
+    try:
+        subprocess.run([
+            "qemu-system-x86_64",
+            "-enable-kvm",
+            "-cpu", "host",
+            "-m", opts.memory,
+            "-smp", str(opts.cpus),
+            "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
+            "-drive", f"if=pflash,format=raw,file={vars_copy.name}",
+            "-drive", f"file={opts.image},format=raw",
+            "-net", "none",
+            "-nographic",
+            "-chardev", f"stdio,mux=on,id=char0,logfile={logfile},signal=off",
+            "-serial", "chardev:char0",
+            "-mon", "chardev=char0",
+        ])
+    finally:
+        Path(vars_copy.name).unlink(missing_ok=True)
+
+    return 0
+
+
 def main() -> int:
     """Darch entry point."""
     parser = argparse.ArgumentParser(
@@ -981,14 +1066,28 @@ def main() -> int:
     p_apply.add_argument("--size", default="10G", help="Image size (default: 10G)")
     p_apply.add_argument("--btrfs", help="Btrfs device (e.g., /dev/nvme0n1p2)")
     p_apply.add_argument("--esp", help="ESP device (e.g., /dev/nvme0n1p1)")
-    p_apply.add_argument("--config", required=True, help="Path to config.py")
+    p_apply.add_argument("--config", default="./config.py", help="Path to config.py")
     p_apply.add_argument("--upgrade", action="store_true", help="Also upgrade all packages (pacman -Syu)")
     p_apply.add_argument("--rebuild", action="store_true", help="Force fresh build even if generations exist")
 
+    # test command
+    p_test = subparsers.add_parser("test", help="Boot an image in QEMU for testing")
+    p_test.add_argument("image", help="Path to disk image")
+    p_test.add_argument("--memory", default="4G", help="VM memory (default: 4G)")
+    p_test.add_argument("--cpus", type=int, default=2, help="Number of CPUs (default: 2)")
+
     args = parser.parse_args()
 
+    if args.command == "test":
+        return test_image(TestOptions(
+            image=args.image,
+            memory=args.memory,
+            cpus=args.cpus,
+        ))
+
+    # Commands below require root
     if os.geteuid() != 0:
-        print("Error: This script must be run as root")
+        print("Error: This command must be run as root")
         return 1
 
     if args.command == "apply":

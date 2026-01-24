@@ -136,6 +136,23 @@ def configure() -> Config:
 
 darch adds its own files (mkinitcpio.conf, initramfs hooks, fstab) before building.
 
+## CLI Commands
+
+```bash
+# Build image (creates if needed, incremental if exists)
+sudo ./darch.py apply --image myvm.img --config config.py
+
+# Force fresh rebuild
+sudo ./darch.py apply --image myvm.img --config config.py --rebuild
+
+# Upgrade all packages
+sudo ./darch.py apply --image myvm.img --config config.py --upgrade
+
+# Boot image in QEMU for testing (no root needed)
+./darch.py test myvm.img
+./darch.py test myvm.img --memory 8G --cpus 4
+```
+
 ## GRUB
 
 GRUB config lists all generations with creation timestamps, newest first. Each entry loads the kernel directly from the btrfs subvolume with the generation number as a kernel parameter.
