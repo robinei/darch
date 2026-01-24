@@ -11,13 +11,27 @@ Creates bootable disk images with:
 
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Set, Dict, Tuple, Literal
 import argparse
+import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
+
+
+LOCKFILE = Path("/var/lock/darch.lock")
+
+# Garbage collection settings
+GC_KEEP_MIN = 3          # Always keep at least this many complete generations
+GC_KEEP_MAX = 10         # Keep at most this many generations (0 = unlimited)
+GC_MIN_AGE_DAYS = 7      # Never delete generations younger than this
+GC_MAX_AGE_DAYS = 30     # Delete generations older than this (0 = keep forever)
 
 
 # =============================================================================
@@ -167,10 +181,15 @@ class Config:
 
 @dataclass
 class GenerationInfo:
-    """Info about a generation."""
+    """Info about a generation.
+
+    A generation is complete only if it has config.json (written at end of build).
+    Incomplete generations result from failed/interrupted builds.
+    """
     gen: int
-    path: str
-    created_at: str
+    path: Path
+    complete: bool              # True if config.json exists
+    created_at: float | None    # Unix timestamp (None if incomplete)
 
 
 # =============================================================================
@@ -355,8 +374,9 @@ search --set=root --fs-uuid {root_uuid}
     entries = []
     # Newest first
     for g in sorted(generations, key=lambda x: x.gen, reverse=True):
+        created_str = datetime.fromtimestamp(g.created_at).strftime("%Y-%m-%d %H:%M")
         entries.append(f"""
-menuentry "Arch Linux (gen-{g.gen}, {g.created_at})" {{
+menuentry "Arch Linux (gen-{g.gen}, {created_str})" {{
     linux /@images/gen-{g.gen}/boot/vmlinuz-linux \\
         root=UUID={root_uuid} \\
         darch.gen={g.gen} \\
@@ -374,9 +394,10 @@ menuentry "Arch Linux (gen-{g.gen}, {g.created_at})" {{
 @dataclass
 class BuildContext:
     """Runtime context for a build - paths and UUIDs discovered during setup."""
-    mount_root: str      # Where generation is mounted (e.g., /mnt/arch-build)
-    efi_mount: str       # Where ESP is mounted (e.g., /mnt/arch-build/efi)
-    var_path: str        # Where @var is mounted (e.g., /mnt/arch-build/var)
+    mount_root: Path     # Where generation is mounted
+    efi_mount: Path      # Where ESP is mounted
+    var_path: Path       # Where @var is mounted (or will be mounted)
+    btrfs_dev: str       # Btrfs device path (for mounting @var)
     esp_uuid: str        # UUID of ESP partition
     root_uuid: str       # UUID of btrfs partition
     gen: int = 1         # Generation number
@@ -384,14 +405,58 @@ class BuildContext:
     upgrade: bool = False       # Run pacman -Syu
 
 
-def run(cmd, check=True, capture_output=False):
+def run(cmd, check=True, capture_output=False) -> str | None:
     """Run a command and optionally capture output."""
     print(f"Running: {' '.join(cmd)}")
-    if capture_output:
-        result = subprocess.run(cmd, check=check, capture_output=True, text=True)
-        return result.stdout.strip()
-    else:
-        subprocess.run(cmd, check=check)
+    try:
+        if capture_output:
+            result = subprocess.run(cmd, check=check, capture_output=True, text=True)
+            return result.stdout.strip()
+        else:
+            subprocess.run(cmd, check=check)
+    except subprocess.CalledProcessError as e:
+        print(f"\nError: Command failed: {' '.join(cmd)}")
+        print(f"Exit code: {e.returncode}")
+        if e.stderr:
+            print(f"stderr:\n{e.stderr}")
+        raise
+
+
+def chroot_run(root: Path, *cmd, check=True, capture_output=False) -> str | None:
+    """Run a command inside a chroot."""
+    return run(["arch-chroot", str(root)] + list(cmd), check=check, capture_output=capture_output)
+
+
+def write_file_entry(path: Path, entry: FileEntry | SymlinkEntry):
+    """Write a file or symlink entry to the filesystem."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() or path.is_symlink():
+        path.unlink()
+    if entry[0] == 'file':
+        content, mode = entry[1], entry[2]
+        path.write_text(content)
+        if mode is not None:
+            path.chmod(mode)
+    elif entry[0] == 'symlink':
+        path.symlink_to(entry[1])
+
+
+def force_symlink(path: Path, target: str):
+    """Create a symlink, removing any existing file/symlink first."""
+    if path.exists() or path.is_symlink():
+        path.unlink()
+    path.symlink_to(target)
+
+
+def setup_var_pacman_symlink(var_path: Path):
+    """Create the pacman symlink in @var pointing to generation's /pacman."""
+    var_lib = var_path / "lib"
+    var_lib.mkdir(parents=True, exist_ok=True)
+    pacman_link = var_lib / "pacman"
+    # Symlink: /var/lib/pacman -> ../../../current/pacman
+    # At runtime: exits @var mount, reaches tmpfs /, follows /current to generation
+    # At build time in chroot: /current -> . so resolves to /pacman
+    force_symlink(pacman_link, "../../../current/pacman")
 
 
 def build_generation(config: Config, ctx: BuildContext):
@@ -400,97 +465,86 @@ def build_generation(config: Config, ctx: BuildContext):
 
     Expects:
     - ctx.mount_root: generation subvolume mounted here
-    - ctx.var_path: @var subvolume mounted here
     - ctx.efi_mount: ESP mounted here
+    - @var NOT mounted (we mount it after moving pacman db)
     - Partitions already formatted, subvolumes already created
     """
     print("\n=== Installing base system with pacstrap ===")
-    run(["pacstrap", "-K", ctx.mount_root] + list(config.packages))
+    # Bind-mount host's package cache so pacstrap reads/writes there.
+    # On non-darch host: uses host cache. On darch system: uses @var cache.
+    gen_cache = ctx.mount_root / "var" / "cache" / "pacman" / "pkg"
+    gen_cache.mkdir(parents=True, exist_ok=True)
+    with mount("/var/cache/pacman/pkg", gen_cache, bind=True):
+        run(["pacstrap", "-K", str(ctx.mount_root)] + sorted(config.packages))
 
-    # Apply config.files (locale.gen, mkinitcpio.conf, hooks needed by chroot commands)
-    print("\n=== Applying config files ===")
-    for path, entry in config.files.items():
-        full_path = f"{ctx.mount_root}{path}"
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        if os.path.exists(full_path) or os.path.islink(full_path):
-            os.remove(full_path)
-        if entry[0] == 'file':
-            content, mode = entry[1], entry[2]
-            with open(full_path, 'w') as f:
-                f.write(content)
-            if mode is not None:
-                os.chmod(full_path, mode)
-        elif entry[0] == 'symlink':
-            os.symlink(entry[1], full_path)
-        print(f"  {entry[0]}: {path}")
+    print("\n=== Relocating pacman state to /pacman ===")
+    pacman_src = ctx.mount_root / "var" / "lib" / "pacman"
+    pacman_dst = ctx.mount_root / "pacman"
+    if pacman_src.exists():
+        shutil.move(str(pacman_src), str(pacman_dst))
+        print(f"  Moved {pacman_src} -> {pacman_dst}")
 
-    print("\n=== Configuring system (in chroot) ===")
-    # Chroot script runs commands that can't be done declaratively
-    chroot_script = """#!/bin/bash
-set -e
+    print("\n=== Creating /current -> . symlink (for build-time pacman access) ===")
+    force_symlink(ctx.mount_root / "current", ".")
 
-echo "=== Setting hardware clock ==="
-hwclock --systohc
+    print("\n=== Removing /var from generation (will be @var mount point) ===")
+    var_in_gen = ctx.mount_root / "var"
+    if var_in_gen.exists():
+        shutil.rmtree(var_in_gen)
+        print("  Removed /var from generation")
+    var_in_gen.mkdir(exist_ok=True)
 
-echo "=== Generating locales ==="
-locale-gen
+    print("\n=== Mounting @var and setting up pacman symlink ===")
+    with mount(ctx.btrfs_dev, var_in_gen, "subvol=@var"):
+        setup_var_pacman_symlink(var_in_gen)
 
-echo "=== Setting root password (empty for testing) ==="
-passwd -d root
+        # Apply config.files (locale.gen, mkinitcpio.conf, hooks needed by chroot commands)
+        print("\n=== Applying config files ===")
+        for path, entry in config.files.items():
+            write_file_entry(ctx.mount_root / path[1:], entry)  # strip leading /
+            print(f"  {entry[0]}: {path}")
 
-echo "=== Regenerating initramfs ==="
-mkinitcpio -P
+        print("\n=== Configuring system ===")
+        chroot_run(ctx.mount_root, "hwclock", "--systohc")
+        chroot_run(ctx.mount_root, "locale-gen")
+        chroot_run(ctx.mount_root, "passwd", "-d", "root")
+        chroot_run(ctx.mount_root, "mkinitcpio", "-P")
+        chroot_run(ctx.mount_root, "grub-install",
+                   "--target=x86_64-efi", "--efi-directory=/efi",
+                   "--boot-directory=/efi", "--bootloader-id=GRUB", "--removable")
 
-echo "=== Installing GRUB to ESP ==="
-grub-install --target=x86_64-efi --efi-directory=/efi --boot-directory=/efi --bootloader-id=GRUB --removable
+        # Create tmpfiles.d overrides for darch layout
+        tmpfiles_dir = ctx.mount_root / "etc/tmpfiles.d"
+        tmpfiles_dir.mkdir(parents=True, exist_ok=True)
 
-echo "=== Creating tmpfiles overrides for darch layout ==="
-mkdir -p /etc/tmpfiles.d
-# Override mtab line to not use L+ (force recreate)
-sed 's|^L+ /etc/mtab|L /etc/mtab|' /usr/lib/tmpfiles.d/etc.conf > /etc/tmpfiles.d/etc.conf
-# Remove /root directory entries (darch has /root as symlink)
-grep -v '^[df].*[[:space:]]/root' /usr/lib/tmpfiles.d/provision.conf > /etc/tmpfiles.d/provision.conf
+        # Override mtab line to not use L+ (force recreate)
+        etc_conf = (ctx.mount_root / "usr/lib/tmpfiles.d/etc.conf").read_text()
+        etc_conf = etc_conf.replace("L+ /etc/mtab", "L /etc/mtab")
+        (tmpfiles_dir / "etc.conf").write_text(etc_conf)
 
-echo "=== Chroot configuration complete ==="
-"""
+        # Remove /root directory entries (darch has /root as symlink)
+        provision_conf = (ctx.mount_root / "usr/lib/tmpfiles.d/provision.conf").read_text()
+        provision_conf = re.sub(r'^[df].*\s/root.*\n', '', provision_conf, flags=re.MULTILINE)
+        (tmpfiles_dir / "provision.conf").write_text(provision_conf)
 
-    chroot_script_path = f"{ctx.mount_root}/root/setup.sh"
-    with open(chroot_script_path, "w") as f:
-        f.write(chroot_script)
-    os.chmod(chroot_script_path, 0o755)
+        print("\n=== Setting up persistent /etc files ===")
+        # Fix directory permissions (pacstrap/systemd may have changed them)
+        (ctx.var_path / "lib/users").chmod(0o755)
+        (ctx.var_path / "lib/machines").chmod(0o755)
 
-    run(["arch-chroot", ctx.mount_root, "/root/setup.sh"])
-
-    print("\n=== Setting up persistent /etc files ===")
-    # Fix directory permissions (pacstrap/systemd may have changed them)
-    os.chmod(f"{ctx.var_path}/lib/users", 0o755)
-    os.chmod(f"{ctx.var_path}/lib/machines", 0o755)
-
-    # User management files: copy to @var on fresh install, just symlink on rebuild
-    user_files = ["passwd", "shadow", "group", "gshadow"]
-    for f in user_files:
-        src = f"{ctx.mount_root}/etc/{f}"
-        dst = f"{ctx.var_path}/lib/users/{f}"
-        if ctx.fresh_install:
-            # Fresh install: copy pacstrap's files to @var
-            if os.path.exists(src) and not os.path.islink(src):
+        # User management files: copy to @var on fresh install, just symlink on rebuild
+        for name in ["passwd", "shadow", "group", "gshadow"]:
+            src = ctx.mount_root / "etc" / name
+            dst = ctx.var_path / "lib/users" / name
+            if ctx.fresh_install and src.exists() and not src.is_symlink():
                 shutil.copy2(src, dst)
-        # Always ensure symlink exists (remove file/old symlink first)
-        if os.path.exists(src) or os.path.islink(src):
-            os.remove(src)
-        os.symlink(f"/var/lib/users/{f}", src)
+            force_symlink(src, f"/var/lib/users/{name}")
 
-    # resolv.conf: symlink to /run (systemd-resolved or NetworkManager will manage)
-    resolv_path = f"{ctx.mount_root}/etc/resolv.conf"
-    if os.path.exists(resolv_path) or os.path.islink(resolv_path):
-        os.remove(resolv_path)
-    os.symlink("/run/systemd/resolve/stub-resolv.conf", resolv_path)
+        # resolv.conf: symlink to /run (systemd-resolved or NetworkManager will manage)
+        force_symlink(ctx.mount_root / "etc/resolv.conf", "/run/systemd/resolve/stub-resolv.conf")
 
-    # mtab: symlink to /proc/mounts (standard)
-    mtab_path = f"{ctx.mount_root}/etc/mtab"
-    if os.path.exists(mtab_path) or os.path.islink(mtab_path):
-        os.remove(mtab_path)
-    os.symlink("/proc/mounts", mtab_path)
+        # mtab: symlink to /proc/mounts (standard)
+        force_symlink(ctx.mount_root / "etc/mtab", "/proc/mounts")
 
 
 @dataclass
@@ -525,13 +579,13 @@ class ConfigDiff:
         )
 
 
-def check_upgrades_available(mount_root: str) -> bool:
+def check_upgrades_available(mount_root: Path) -> bool:
     """Check if package upgrades are available."""
-    result = subprocess.run(
-        ["arch-chroot", mount_root, "checkupdates"],
-        capture_output=True
-    )
-    return result.returncode == 0
+    try:
+        chroot_run(mount_root, "checkupdates", capture_output=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
 def build_incremental(config: Config, ctx: BuildContext, diff: ConfigDiff):
@@ -540,67 +594,73 @@ def build_incremental(config: Config, ctx: BuildContext, diff: ConfigDiff):
 
     Expects:
     - ctx.mount_root: NEW generation subvolume mounted here (snapshot of old)
-    - ctx.var_path: @var subvolume mounted here
     - ctx.efi_mount: ESP mounted here
+    - @var NOT mounted (we mount it here)
     - ctx.upgrade: if True, also run pacman -Syu
     - diff: ConfigDiff between old and new config
     """
-    # Package changes
-    if diff.packages_to_remove:
-        print(f"\n=== Removing packages: {diff.packages_to_remove} ===")
-        run(["arch-chroot", ctx.mount_root, "pacman", "-Rns", "--noconfirm"]
-            + list(diff.packages_to_remove))
+    # Generation already has /pacman_local and /current -> . from previous build
+    # Mount @var so pacman can find its database via the symlink
+    with mount(ctx.btrfs_dev, ctx.var_path, "subvol=@var"):
+        # Package changes
+        if diff.packages_to_remove:
+            print(f"\n=== Removing packages: {diff.packages_to_remove} ===")
+            chroot_run(ctx.mount_root, "pacman", "-Rns", "--noconfirm", *sorted(diff.packages_to_remove))
 
-    if diff.packages_to_install:
-        print(f"\n=== Installing packages: {diff.packages_to_install} ===")
-        run(["arch-chroot", ctx.mount_root, "pacman", "-S", "--noconfirm"]
-            + list(diff.packages_to_install))
+        if diff.packages_to_install:
+            print(f"\n=== Installing packages: {diff.packages_to_install} ===")
+            chroot_run(ctx.mount_root, "pacman", "-S", "--noconfirm", *sorted(diff.packages_to_install))
 
-    if ctx.upgrade:
-        print("\n=== Upgrading system packages ===")
-        run(["arch-chroot", ctx.mount_root, "pacman", "-Syu", "--noconfirm"])
+        if ctx.upgrade:
+            print("\n=== Upgrading system packages ===")
+            chroot_run(ctx.mount_root, "pacman", "-Syu", "--noconfirm")
 
-    # Apply changed files
-    all_file_changes = {**diff.files_to_add, **diff.files_to_update}
-    if all_file_changes:
-        print(f"\n=== Applying {len(all_file_changes)} file changes ===")
-        for path, entry in all_file_changes.items():
-            full_path = f"{ctx.mount_root}{path}"
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            if os.path.exists(full_path) or os.path.islink(full_path):
-                os.remove(full_path)
-            if entry[0] == 'file':
-                content, mode = entry[1], entry[2]
-                with open(full_path, 'w') as f:
-                    f.write(content)
-                if mode is not None:
-                    os.chmod(full_path, mode)
-            elif entry[0] == 'symlink':
-                os.symlink(entry[1], full_path)
-            print(f"  {entry[0]}: {path}")
+        # Apply changed files
+        all_file_changes = {**diff.files_to_add, **diff.files_to_update}
+        if all_file_changes:
+            print(f"\n=== Applying {len(all_file_changes)} file changes ===")
+            for path, entry in all_file_changes.items():
+                write_file_entry(ctx.mount_root / path[1:], entry)
+                print(f"  {entry[0]}: {path}")
 
-    # Remove deleted files
-    if diff.files_to_remove:
-        print(f"\n=== Removing {len(diff.files_to_remove)} files ===")
-        for path in diff.files_to_remove:
-            full_path = f"{ctx.mount_root}{path}"
-            if os.path.exists(full_path) or os.path.islink(full_path):
-                os.remove(full_path)
-                print(f"  removed: {path}")
+        # Remove deleted files
+        if diff.files_to_remove:
+            print(f"\n=== Removing {len(diff.files_to_remove)} files ===")
+            for path in diff.files_to_remove:
+                full_path = ctx.mount_root / path[1:]
+                if full_path.exists() or full_path.is_symlink():
+                    full_path.unlink()
+                    print(f"  removed: {path}")
 
-    # Check if initramfs needs regeneration
-    initramfs_paths = {"/etc/mkinitcpio.conf", "/usr/lib/initcpio/hooks/darch",
-                       "/usr/lib/initcpio/install/darch"}
-    needs_initramfs = bool(set(all_file_changes.keys()) & initramfs_paths)
+        # Check if initramfs needs regeneration
+        initramfs_paths = {"/etc/mkinitcpio.conf", "/usr/lib/initcpio/hooks/darch",
+                           "/usr/lib/initcpio/install/darch"}
+        needs_initramfs = bool(set(all_file_changes.keys()) & initramfs_paths)
 
-    if needs_initramfs:
-        print("\n=== Regenerating initramfs ===")
-        run(["arch-chroot", ctx.mount_root, "mkinitcpio", "-P"])
+        if needs_initramfs:
+            print("\n=== Regenerating initramfs ===")
+            chroot_run(ctx.mount_root, "mkinitcpio", "-P")
 
 
 # =============================================================================
-# Mount context managers
+# Context managers
 # =============================================================================
+
+@contextmanager
+def lockfile():
+    """Acquire exclusive lock to prevent concurrent darch runs."""
+    LOCKFILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOCKFILE, "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"Error: Another darch process is running (lockfile: {LOCKFILE})")
+            sys.exit(1)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
 
 @contextmanager
 def loop_device(image_path: str):
@@ -610,28 +670,37 @@ def loop_device(image_path: str):
     try:
         yield f"{loop}p1", f"{loop}p2"  # esp, btrfs
     finally:
+        run(["sync"])
         run(["losetup", "-d", loop], check=False)
 
 
 @contextmanager
-def mount(device: str, mount_point: str, options: str | None = None):
-    """Mount a filesystem."""
-    os.makedirs(mount_point, exist_ok=True)
+def mount(device: str, mount_point: Path, options: str | None = None, bind: bool = False):
+    """Mount a filesystem, yield mount point as Path."""
+    mount_point.mkdir(parents=True, exist_ok=True)
+    # Ensure not already mounted from a previous failed run
+    run(["umount", str(mount_point)], check=False)
+    cmd = ["mount"]
+    if bind:
+        cmd.append("--bind")
     if options:
-        run(["mount", "-o", options, device, mount_point])
-    else:
-        run(["mount", device, mount_point])
+        cmd.extend(["-o", options])
+    cmd.extend([device, str(mount_point)])
+    run(cmd)
     try:
         yield mount_point
     finally:
-        run(["umount", mount_point], check=False)
+        # Sync to flush writes, then unmount properly
+        run(["sync"])
+        run(["umount", str(mount_point)], check=False)
 
 
 @contextmanager
 def image_file(image_path: str, size: str = "10G"):
     """Create a blank disk image with ESP and btrfs partitions + subvolumes."""
 
-    if os.path.exists(image_path):
+    image = Path(image_path)
+    if image.exists():
         print(f"=== Disk image exists: {image_path} ===")
         with loop_device(image_path) as result:
             yield result
@@ -646,25 +715,25 @@ def image_file(image_path: str, size: str = "10G"):
 
         print("\n=== Setting up loop device ===")
         with loop_device(image_path) as (esp_part, root_part):
-            print(f"\n=== Formatting partitions ===")
+            print("\n=== Formatting partitions ===")
             run(["mkfs.fat", "-F32", esp_part])
             run(["mkfs.btrfs", "-f", root_part])
 
             print("\n=== Creating btrfs subvolumes ===")
-            mount_point = "/mnt/darch-setup"
-            os.makedirs(mount_point, exist_ok=True)
-            run(["mount", root_part, mount_point])
+            mount_point = Path("/mnt/darch-setup")
+            mount_point.mkdir(parents=True, exist_ok=True)
+            run(["mount", root_part, str(mount_point)])
 
-            run(["btrfs", "subvol", "create", f"{mount_point}/@images"])
-            run(["btrfs", "subvol", "create", f"{mount_point}/@var"])
-            run(["btrfs", "subvol", "create", f"{mount_point}/@home"])
+            run(["btrfs", "subvol", "create", str(mount_point / "@images")])
+            run(["btrfs", "subvol", "create", str(mount_point / "@var")])
+            run(["btrfs", "subvol", "create", str(mount_point / "@home")])
 
-            os.makedirs(f"{mount_point}/@home/root", mode=0o700, exist_ok=True)
-            os.makedirs(f"{mount_point}/@var/lib/users", exist_ok=True)
-            os.makedirs(f"{mount_point}/@var/lib/machines", exist_ok=True)
+            (mount_point / "@home/root").mkdir(mode=0o700, parents=True, exist_ok=True)
+            (mount_point / "@var/lib/users").mkdir(parents=True, exist_ok=True)
+            (mount_point / "@var/lib/machines").mkdir(parents=True, exist_ok=True)
 
-            run(["umount", mount_point])
-            print(f"\n=== Image created successfully ===")
+            run(["umount", str(mount_point)])
+            print("\n=== Image created successfully ===")
             yield esp_part, root_part
 
 
@@ -672,43 +741,111 @@ def image_file(image_path: str, size: str = "10G"):
 # Operations on mounted filesystems
 # =============================================================================
 
-def get_generations(images_path: str) -> list[GenerationInfo]:
-    """Get all generations from mounted @images, sorted by gen number."""
-    from datetime import datetime
+def get_generations(images: Path) -> list[GenerationInfo]:
+    """Get all generations from mounted @images, sorted by gen number.
+
+    Returns both complete and incomplete generations. Use the `complete` field
+    to filter as needed.
+    """
     result = []
-    for entry in os.listdir(images_path):
-        if entry.startswith("gen-"):
-            try:
-                gen = int(entry[4:])
-            except ValueError:
-                continue
-            gen_path = f"{images_path}/{entry}"
-            config_path = f"{gen_path}/config.json"
-            try:
-                ctime = os.stat(config_path).st_ctime
-                created_at = datetime.fromtimestamp(ctime).strftime("%Y-%m-%d %H:%M")
-            except FileNotFoundError:
-                created_at = "unknown"
-            result.append(GenerationInfo(gen=gen, path=gen_path, created_at=created_at))
+    for p in images.glob("gen-*"):
+        if not p.name[4:].isdigit():
+            continue
+        gen = int(p.name[4:])
+        config_path = p / "config.json"
+        if config_path.exists():
+            created_at = config_path.stat().st_ctime
+            complete = True
+        else:
+            created_at = None
+            complete = False
+        result.append(GenerationInfo(gen=gen, path=p, complete=complete, created_at=created_at))
     return sorted(result, key=lambda g: g.gen)
 
 
-def create_gen_subvol(images_path: str, gen: int, snapshot_from: int | None = None):
+def garbage_collect_generations(images: Path) -> list[int]:
+    """Delete incomplete and old generations based on GC settings.
+
+    Policy:
+    - Always delete incomplete generations (failed builds)
+    - Never delete generations younger than GC_MIN_AGE_DAYS
+    - Always keep at least GC_KEEP_MIN complete generations
+    - Delete oldest if count exceeds GC_KEEP_MAX (and old enough)
+    - Delete generations older than GC_MAX_AGE_DAYS (if above GC_KEEP_MIN)
+
+    Returns list of deleted generation numbers.
+    """
+    now = time.time()
+    deleted = []
+    gens = get_generations(images)
+
+    # First pass: delete all incomplete generations
+    for g in gens:
+        if not g.complete:
+            print(f"Deleting incomplete gen-{g.gen}")
+            run(["btrfs", "subvol", "delete", str(g.path)])
+            deleted.append(g.gen)
+
+    # Second pass: GC old complete generations
+    complete = [g for g in gens if g.complete]
+    if len(complete) <= GC_KEEP_MIN:
+        return deleted
+
+    # Sort by gen number (oldest first) for deletion candidates
+    complete_sorted = sorted(complete, key=lambda g: g.gen)
+    complete_deleted = []
+
+    for g in complete_sorted:
+        remaining = len(complete) - len(complete_deleted)
+
+        # Stop if we're at minimum
+        if remaining <= GC_KEEP_MIN:
+            break
+
+        age_days = (now - g.created_at) / 86400
+
+        # Never delete generations younger than min age
+        if age_days < GC_MIN_AGE_DAYS:
+            continue
+
+        # Delete if over max age
+        if GC_MAX_AGE_DAYS > 0 and age_days > GC_MAX_AGE_DAYS:
+            print(f"Deleting old gen-{g.gen} (age: {age_days:.0f} days)")
+            run(["btrfs", "subvol", "delete", str(g.path)])
+            complete_deleted.append(g.gen)
+            continue
+
+        # Delete if over max count
+        if GC_KEEP_MAX > 0 and remaining > GC_KEEP_MAX:
+            print(f"Deleting excess gen-{g.gen} (count: {remaining} > {GC_KEEP_MAX})")
+            run(["btrfs", "subvol", "delete", str(g.path)])
+            complete_deleted.append(g.gen)
+
+    return deleted + complete_deleted
+
+
+def create_gen_subvol(images: Path, gen: int, snapshot_from: int | None = None):
     """Create a generation subvolume in mounted @images."""
-    target = f"{images_path}/gen-{gen}"
+    target = images / f"gen-{gen}"
+    # Delete existing subvolume if present (e.g., from failed build)
+    if target.exists():
+        print(f"Deleting existing gen-{gen}")
+        run(["btrfs", "subvol", "delete", str(target)])
     if snapshot_from is not None:
-        source = f"{images_path}/gen-{snapshot_from}"
+        source = images / f"gen-{snapshot_from}"
         print(f"Creating gen-{gen} as snapshot of gen-{snapshot_from}")
-        run(["btrfs", "subvol", "snapshot", source, target])
+        run(["btrfs", "subvol", "snapshot", str(source), str(target)])
     else:
         print(f"Creating gen-{gen}")
-        run(["btrfs", "subvol", "create", target])
+        run(["btrfs", "subvol", "create", str(target)])
 
 
-def load_gen_config(gen_path: str) -> Config:
-    """Load config.json from mounted generation."""
-    with open(f"{gen_path}/config.json") as f:
-        return Config.from_json(f.read())
+def load_gen_config(gen_path: Path) -> Config | None:
+    """Load config.json from mounted generation, or None if not found."""
+    config_file = gen_path / "config.json"
+    if not config_file.exists():
+        return None
+    return Config.from_json(config_file.read_text())
 
 
 def load_config_module(config_path: str) -> Config:
@@ -754,17 +891,24 @@ def main():
             print("Error: --image or (--btrfs and --esp) required")
             return 1
 
-        config = load_config_module(args.config)
-
         with ExitStack() as stack:
+            stack.enter_context(lockfile())
+            config = load_config_module(args.config)
+
             if args.image:
                 esp_dev, btrfs_dev = stack.enter_context(image_file(args.image, args.size))
             else:
                 esp_dev, btrfs_dev = (args.esp, args.btrfs)
 
-            images = stack.enter_context(mount(btrfs_dev, "/mnt/darch-images", "subvol=@images"))
+            images = stack.enter_context(mount(btrfs_dev, Path("/mnt/darch-images"), "subvol=@images"))
+
+            # Clean up incomplete generations from failed builds
+            garbage_collect_generations(images)
+
+            # Find current complete generation
             gens = get_generations(images)
-            current = gens[-1].gen if gens else None
+            complete_gens = [g for g in gens if g.complete]
+            current = complete_gens[-1].gen if complete_gens else None
             new_gen = (current or 0) + 1
 
             # Get UUIDs and add runtime-dependent files before diffing
@@ -776,27 +920,39 @@ def main():
             diff = None
             if not fresh:
                 # Check for changes before creating new generation
-                old_mount = stack.enter_context(
-                    mount(btrfs_dev, "/mnt/darch-old", f"subvol=@images/gen-{current}"))
-                old_config = load_gen_config(old_mount)
+                old_gen = stack.enter_context(
+                    mount(btrfs_dev, Path("/mnt/darch-old"), f"subvol=@images/gen-{current}"))
+                old_config = load_gen_config(old_gen)
 
-                diff = ConfigDiff.compute(old_config, config)
+                if old_config is None:
+                    print(f"gen-{current} has no config.json, forcing rebuild")
+                    fresh = True
+                else:
+                    diff = ConfigDiff.compute(old_config, config)
 
-                if not diff.has_changes() and not (args.upgrade and check_upgrades_available(old_mount)):
-                    print("Already up to date.")
-                    return 0
+                    if not diff.has_changes() and not (args.upgrade and check_upgrades_available(old_gen)):
+                        print("Already up to date.")
+                        return 0
 
             # Create and mount new generation
             create_gen_subvol(images, new_gen, snapshot_from=None if fresh else current)
-            mount_root = "/mnt/darch-build"
+            mount_root = Path("/mnt/darch-build")
             stack.enter_context(mount(btrfs_dev, mount_root, f"subvol=@images/gen-{new_gen}"))
-            stack.enter_context(mount(btrfs_dev, f"{mount_root}/var", "subvol=@var"))
-            stack.enter_context(mount(esp_dev, f"{mount_root}/efi"))
+            stack.enter_context(mount(esp_dev, mount_root / "efi"))
+            # Note: @var is mounted by builder functions, not here
+
+            # For incremental builds, invalidate inherited config.json so a failed
+            # build is clearly incomplete. Rename to .prev for debugging.
+            if not fresh:
+                old_config_file = mount_root / "config.json"
+                if old_config_file.exists():
+                    old_config_file.rename(mount_root / "config.json.prev")
 
             ctx = BuildContext(
                 mount_root=mount_root,
-                efi_mount=f"{mount_root}/efi",
-                var_path=f"{mount_root}/var",
+                efi_mount=mount_root / "efi",
+                var_path=mount_root / "var",
+                btrfs_dev=btrfs_dev,
                 esp_uuid=esp_uuid,
                 root_uuid=root_uuid,
                 gen=new_gen,
@@ -811,16 +967,14 @@ def main():
 
             # Save config
             print("\n=== Saving config ===")
-            with open(f"{ctx.mount_root}/config.json", "w") as f:
-                f.write(config.to_json())
+            (ctx.mount_root / "config.json").write_text(config.to_json())
 
-            # Write GRUB config with all generations
+            # Write GRUB config with all complete generations
             print("\n=== Writing GRUB config ===")
-            gens = get_generations(images)
-            grub_cfg_path = f"{ctx.efi_mount}/grub/grub.cfg"
-            os.makedirs(os.path.dirname(grub_cfg_path), exist_ok=True)
-            with open(grub_cfg_path, "w") as f:
-                f.write(generate_grub_config(ctx.root_uuid, gens))
+            complete_gens = [g for g in get_generations(images) if g.complete]
+            grub_cfg = ctx.efi_mount / "grub" / "grub.cfg"
+            grub_cfg.parent.mkdir(parents=True, exist_ok=True)
+            grub_cfg.write_text(generate_grub_config(ctx.root_uuid, complete_gens))
 
             print(f"\n=== SUCCESS: Built gen-{new_gen} ===")
 
