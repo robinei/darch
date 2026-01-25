@@ -130,7 +130,14 @@ class Config:
 
     # All packages (passed to pacstrap)
     packages: Set[str] = field(default_factory=lambda: {
-        "base", "linux", "btrfs-progs", "grub", "efibootmgr", "pacman-contrib"
+        # these packages are needed for darch to function
+        "base",
+        "btrfs-progs",
+        "grub",
+        "efibootmgr",
+        "python",
+        "pacman-contrib",
+        "arch-install-scripts"
     })
 
     # Files and symlinks: path -> ('file', content) | ('symlink', target)
@@ -152,6 +159,10 @@ class Config:
         """Add packages to install."""
         self.packages.update(names)
         return self
+
+    def enable_qemu_testing(self):
+        """Add packages necessary for darch to create images, and to run them with QEMU."""
+        self.add_packages("edk2-ovmf", "qemu", "gptfdisk", "dosfstools")
 
     def add_file(self, path: str, content: str, mode: int | None = None) -> Config:
         """Add a file with content and optional mode."""

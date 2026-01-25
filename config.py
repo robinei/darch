@@ -33,12 +33,14 @@ def configure() -> Config:
 
     # Packages
     config.add_packages(
+        "linux",
         "strace",
         "htop",
         "btop",
         "helix",
     )
 
+    config.enable_qemu_testing()
     enable_sway(config, user)
     enable_fish(config, user)
 
