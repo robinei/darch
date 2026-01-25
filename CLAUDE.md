@@ -89,11 +89,17 @@ New generations are created as btrfs snapshots of the previous, making increment
 
 ### User Management
 
-Users are declared in config via the `User` class. User files (`/etc/passwd`, `/etc/shadow`, etc.) are written directly to the generation's /etc directory at build time. This keeps users immutable per generation, consistent with the declarative design. Home directories are created in @home (persistent).
+Users are declared in config via the `User` class and added to `config.users`. User files (`/etc/passwd`, `/etc/shadow`, etc.) are written directly to the generation's /etc directory at build time. This keeps users immutable per generation, consistent with the declarative design. Home directories are created in @home (persistent). Missing groups are created automatically.
 
 ```python
-config.user = User("robin", shell="/bin/fish", groups={"wheel", "seat"})
-config.user.add_groups("video", "audio")  # Can add groups later (e.g., from helper functions)
+user = User("robin", groups={"wheel"})
+root = User("root", uid=0, password_hash="$6$...")
+config.users = [user, root]
+
+# Helper functions take user explicitly
+def enable_sway(config: Config, user: User):
+    config.add_packages("sway", "foot")
+    user.add_groups("seat")
 ```
 
 ### Initramfs Hook
@@ -115,7 +121,7 @@ A custom mkinitcpio hook (`darch`) overrides the mount handler to:
 6. Remove /var from generation
 7. Mount @var, create pacman symlink
 8. Run chroot configuration
-9. Configure declarative user (if set)
+9. Configure declarative users
 10. Save config.json
 
 ### Incremental Build
@@ -124,7 +130,7 @@ A custom mkinitcpio hook (`darch`) overrides the mount handler to:
 3. Apply package diff with pacman
 4. Apply file changes
 5. Regenerate initramfs if needed
-6. Configure declarative user (if set)
+6. Configure declarative users
 7. Save config.json
 
 ## Configuration
@@ -133,12 +139,12 @@ A custom mkinitcpio hook (`darch`) overrides the mount handler to:
 
 ```python
 def configure() -> Config:
-    config = Config(name="myvm")
+    config = Config()
     config.add_packages("htop", "vim")
     config.set_hostname("myvm")
     config.set_timezone("UTC")
     config.enable_service("sshd")
-    config.user = User("robin", shell="/bin/bash", groups={"wheel"})
+    config.users = [User("robin", groups={"wheel"})]
     return config
 ```
 

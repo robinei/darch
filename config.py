@@ -2,19 +2,17 @@
 from darch import Config, User
 
 
-def enable_sway(config: Config):
+def enable_sway(config: Config, user: User):
     """Adds sway and associated packages."""
     config.add_packages("sway", "foot", "mesa", "xorg-xwayland")
     config.enable_service("seatd")
-    # Add seat group to user if configured
-    if config.user:
-        config.user.add_groups("seat")
+    user.add_groups("seat")
 
 
-def enable_fish(config: Config):
+def enable_fish(config: Config, user: User):
     """Enable the fish shell."""
     config.add_packages("fish")
-    config.user.shell = "/usr/bin/fish"
+    user.shell = "/usr/bin/fish"
 
 
 def configure() -> Config:
@@ -23,15 +21,15 @@ def configure() -> Config:
 
     # System settings
     config.set_hostname("archvm")
-    config.set_timezone("UTC")
+    config.set_timezone("Europe/Oslo")
     config.set_locales("en_US.UTF-8", "nb_NO.UTF-8")
     config.set_keymap("no")
 
-    # User
-    config.user = User("robin",
-        groups = {"wheel"},
-        password_hash = "$6$bxSIgU/AEruP0HSu$UCk/mosb6FkwuJ556RZn.CHQy1Ys4cFmFVikf5a5QvTo4EO8HGXLFvRHLJdE.QMjFptVAqY/EzwVkYjA7vwwX1",
-    )
+    # Users
+    password_hash="$6$bxSIgU/AEruP0HSu$UCk/mosb6FkwuJ556RZn.CHQy1Ys4cFmFVikf5a5QvTo4EO8HGXLFvRHLJdE.QMjFptVAqY/EzwVkYjA7vwwX1"
+    user = User("robin", groups={"wheel"}, password_hash=password_hash)
+    root = User("root", uid=0, password_hash=password_hash)
+    config.users = [user, root]
 
     # Packages
     config.add_packages(
@@ -41,8 +39,8 @@ def configure() -> Config:
         "helix",
     )
 
-    enable_sway(config)
-    enable_fish(config)
+    enable_sway(config, user)
+    enable_fish(config, user)
 
     # Services
     config.enable_service("serial-getty@ttyS0")

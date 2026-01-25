@@ -91,13 +91,13 @@ class ConfigDiff:
     files_to_add: Dict[str, FileEntry | SymlinkEntry]
     files_to_remove: Dict[str, FileEntry | SymlinkEntry]
     files_to_update: Dict[str, FileEntry | SymlinkEntry]
-    user_changed: bool
+    users_changed: bool
 
     @classmethod
     def compute(cls, old: Config, new: Config) -> ConfigDiff:
         """Compare two configs and return the differences."""
-        old_user = json.dumps(old.user.to_dict(), sort_keys=True) if old.user else None
-        new_user = json.dumps(new.user.to_dict(), sort_keys=True) if new.user else None
+        old_users = json.dumps([u.to_dict() for u in old.users], sort_keys=True)
+        new_users = json.dumps([u.to_dict() for u in new.users], sort_keys=True)
         return cls(
             packages_to_install=new.packages - old.packages,
             packages_to_remove=old.packages - new.packages,
@@ -105,7 +105,7 @@ class ConfigDiff:
             files_to_remove={p: e for p, e in old.files.items() if p not in new.files},
             files_to_update={p: e for p, e in new.files.items()
                              if p in old.files and old.files[p] != e},
-            user_changed=old_user != new_user,
+            users_changed=old_users != new_users,
         )
 
     def has_changes(self) -> bool:
@@ -116,7 +116,7 @@ class ConfigDiff:
             self.files_to_add or
             self.files_to_remove or
             self.files_to_update or
-            self.user_changed
+            self.users_changed
         )
 
 
@@ -141,8 +141,8 @@ class Config:
         "btrfs", "ata_piix", "ahci", "sd_mod", "virtio_blk", "virtio_pci"
     })
 
-    # User (optional)
-    user: User | None = None
+    # Users
+    users: list[User] = field(default_factory=list)
 
     # -------------------------------------------------------------------------
     # Builder methods
@@ -217,7 +217,7 @@ class Config:
             "packages": sorted(self.packages),
             "files": files_serialized,
             "initramfs_modules": sorted(self.initramfs_modules),
-            "user": self.user.to_dict() if self.user else None,
+            "users": [u.to_dict() for u in self.users],
         }
 
     @classmethod
@@ -229,9 +229,8 @@ class Config:
         # Convert files: lists back to tuples
         for path, entry in data.get("files", {}).items():
             config.files[path] = tuple(entry)
-        # Deserialize user if present
-        if data.get("user"):
-            config.user = User.from_dict(data["user"])
+        # Deserialize users
+        config.users = [User.from_dict(u) for u in data.get("users", [])]
         return config
 
     def to_json(self) -> str:
@@ -454,31 +453,36 @@ menuentry "Arch Linux (gen-{g.gen}, {created_str})" {{
     return header + "".join(entries) + "\n"
 
 
-def configure_user(user: User, gen_root: Path, home_path: Path):
+def configure_users(users: list[User], gen_root: Path, home_path: Path):
     """
-    Configure the declarative user in the generation.
+    Configure declarative users in the generation.
 
-    Reads base system users from generation's /etc, appends declarative user,
-    writes back. Also creates home directory in @home.
+    Reads base system users from generation's /etc, adds/updates declarative users,
+    writes back. Also creates home directories in @home.
     """
+    if not users:
+        return
+
     etc = gen_root / "etc"
+    user_names = {u.name for u in users}
 
-    # Read base system files
+    # Read base system files, filtering out declarative users
     passwd_lines = [l for l in (etc / "passwd").read_text().splitlines()
-                    if l and not l.startswith(f"{user.name}:")]
+                    if l and l.split(":")[0] not in user_names]
     shadow_lines = [l for l in (etc / "shadow").read_text().splitlines()
-                    if l and not l.startswith(f"{user.name}:")]
+                    if l and l.split(":")[0] not in user_names]
     group_lines = [l for l in (etc / "group").read_text().splitlines()
-                   if l and not l.startswith(f"{user.name}:")]
+                   if l and l.split(":")[0] not in user_names]
     gshadow_lines = [l for l in (etc / "gshadow").read_text().splitlines()
-                     if l and not l.startswith(f"{user.name}:")]
+                     if l and l.split(":")[0] not in user_names]
 
-    # Add user entry
-    passwd_lines.append(f"{user.name}:x:{user.uid}:{user.uid}::/home/{user.name}:{user.shell}")
-    pw_hash = user.password_hash if user.password_hash else "!"
-    shadow_lines.append(f"{user.name}:{pw_hash}:19000:0:99999:7:::")
-    group_lines.append(f"{user.name}:x:{user.uid}:")
-    gshadow_lines.append(f"{user.name}:!::")
+    # Add user entries
+    for user in users:
+        passwd_lines.append(f"{user.name}:x:{user.uid}:{user.uid}::/home/{user.name}:{user.shell}")
+        pw_hash = user.password_hash if user.password_hash else "!"
+        shadow_lines.append(f"{user.name}:{pw_hash}:19000:0:99999:7:::")
+        group_lines.append(f"{user.name}:x:{user.uid}:")
+        gshadow_lines.append(f"{user.name}:!::")
 
     # Find existing group names and max GID for creating new groups
     existing_groups = set()
@@ -494,22 +498,31 @@ def configure_user(user: User, gen_root: Path, home_path: Path):
             except ValueError:
                 pass
 
+    # Collect all needed groups from all users
+    all_groups = set()
+    for user in users:
+        all_groups.update(user.groups)
+
     # Create missing groups
-    for group_name in sorted(user.groups):
+    for group_name in sorted(all_groups):
         if group_name not in existing_groups:
             max_gid += 1
             group_lines.append(f"{group_name}:x:{max_gid}:")
             gshadow_lines.append(f"{group_name}:!::")
+            existing_groups.add(group_name)
             print(f"  Created group: {group_name} (gid={max_gid})")
 
-    # Add user to supplementary groups
+    # Add users to their supplementary groups
     new_group_lines = []
     for line in group_lines:
         parts = line.split(":")
-        if len(parts) >= 4 and parts[0] in user.groups:
+        if len(parts) >= 4:
+            group_name = parts[0]
             members = [m for m in parts[3].split(",") if m]
-            if user.name not in members:
-                members.append(user.name)
+            # Add each user who should be in this group
+            for user in users:
+                if group_name in user.groups and user.name not in members:
+                    members.append(user.name)
             parts[3] = ",".join(members)
         new_group_lines.append(":".join(parts))
 
@@ -521,13 +534,14 @@ def configure_user(user: User, gen_root: Path, home_path: Path):
     (etc / "gshadow").write_text("\n".join(gshadow_lines) + "\n")
     (etc / "gshadow").chmod(0o600)
 
-    # Create home directory in @home if needed
-    user_home = home_path / user.name
-    if not user_home.exists():
-        user_home.mkdir(parents=True, exist_ok=True)
-        user_home.chmod(0o700)
-        os.chown(user_home, user.uid, user.uid)
-        print(f"  Created home directory: {user_home}")
+    # Create home directories in @home
+    for user in users:
+        user_home = home_path / user.name
+        if not user_home.exists():
+            user_home.mkdir(parents=True, exist_ok=True)
+            user_home.chmod(0o700)
+            os.chown(user_home, user.uid, user.uid)
+            print(f"  Created home directory: {user_home}")
 
 
 # =============================================================================
@@ -1066,14 +1080,13 @@ def apply_configuration(
             assert diff is not None
             build_incremental(diff, ctx)
 
-        # Configure declarative user if specified
-        if config.user:
-            print(f"\n=== Configuring user: {config.user.name} ===")
+        # Configure declarative users
+        if config.users:
+            print(f"\n=== Configuring users: {[u.name for u in config.users]} ===")
             home_mount = ctx.mount_root / "home"
             home_mount.mkdir(exist_ok=True)
             with mount(ctx.btrfs_dev, home_mount, "subvol=@home"):
-                configure_user(config.user, ctx.mount_root, home_mount)
-            print(f"  Groups: {sorted(config.user.groups)}")
+                configure_users(config.users, ctx.mount_root, home_mount)
 
         # Save config
         print("\n=== Saving config ===")
