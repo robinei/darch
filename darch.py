@@ -163,12 +163,12 @@ class Config:
         self.files[path] = ('symlink', target)
         return self
 
-    def enable_service(self, name: str) -> Config:
-        """Enable a systemd service (creates symlink)."""
+    def enable_service(self, name: str, target: str = "multi-user.target") -> Config:
+        """Enable a systemd service (creates symlink in target.wants)."""
         if not name.endswith(('.service', '.socket', '.timer', '.path', '.mount')):
             name = f"{name}.service"
         return self.add_symlink(
-            f"/etc/systemd/system/multi-user.target.wants/{name}",
+            f"/etc/systemd/system/{target}.wants/{name}",
             f"/usr/lib/systemd/system/{name}"
         )
 
@@ -404,7 +404,7 @@ HELPEOF
 '''
 
 
-def generate_fstab(esp_uuid: str) -> str:
+def generate_fstab(esp_uuid: str, root_uuid: str) -> str:
     """Generate /etc/fstab content."""
     return f"""# /etc/fstab: static file system information
 # Root is tmpfs, @images/@var/@home mounted by initramfs
@@ -413,6 +413,9 @@ def generate_fstab(esp_uuid: str) -> str:
 
 # EFI System Partition
 UUID={esp_uuid}             /efi           vfat    rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro  0 2
+
+# @var (mounted by initramfs)
+UUID={root_uuid}            /var           btrfs   rw,subvol=@var,x-initrd.mount,nofail  0 0
 """
 
 
@@ -1032,7 +1035,7 @@ def apply_configuration(
         # Get UUIDs and add runtime-dependent files before diffing
         esp_uuid = run(["blkid", "-s", "UUID", "-o", "value", esp_dev], capture_output=True)
         root_uuid = run(["blkid", "-s", "UUID", "-o", "value", btrfs_dev], capture_output=True)
-        config.add_file("/etc/fstab", generate_fstab(esp_uuid))
+        config.add_file("/etc/fstab", generate_fstab(esp_uuid, root_uuid))
 
         fresh = current is None or rebuild
         diff = None
