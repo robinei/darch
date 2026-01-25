@@ -578,13 +578,18 @@ class BuildContext:
 
 def run(cmd, check=True, capture_output=False) -> str:
     """Run a command and optionally capture output."""
+    # Clean environment: remove locale vars to prevent host locale leaking into chroot
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("LC_") and k not in ("LANGUAGE",)}
+    env["LC_ALL"] = "C"
+
     cmd_str = ' '.join(str(c) for c in cmd)
     print(f"Running: {cmd_str}")
     try:
         if capture_output:
-            result = subprocess.run(cmd, check=check, capture_output=True, text=True)
+            result = subprocess.run(cmd, check=check, capture_output=True, text=True, env=env)
             return result.stdout.strip()
-        subprocess.run(cmd, check=check)
+        subprocess.run(cmd, check=check, env=env)
         return ""
     except subprocess.CalledProcessError as e:
         print(f"\nError: Command failed: {cmd_str}")
@@ -607,18 +612,36 @@ def fix_owner(path: Path):
         os.chown(path, int(uid), int(gid))
 
 
-def write_file_entry(path: Path, entry: FileEntry | SymlinkEntry):
-    """Write a file or symlink entry to the filesystem."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() or path.is_symlink():
-        path.unlink()
-    if entry[0] == 'file':
-        content, mode = entry[1], entry[2]
-        path.write_text(content)
-        if mode is not None:
-            path.chmod(mode)
-    elif entry[0] == 'symlink':
-        path.symlink_to(entry[1])
+def write_config_files(root: Path, files: Dict[str, FileEntry | SymlinkEntry]) -> Set[str]:
+    """Write config files to filesystem, returning paths that were changed."""
+    changed = set()
+    for config_path, entry in files.items():
+        path = root / config_path[1:]  # strip leading /
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Check if file already matches
+        if entry[0] == 'file':
+            content, mode = entry[1], entry[2]
+            if path.is_file() and not path.is_symlink():
+                if path.read_text() == content and (mode is None or path.stat().st_mode & 0o777 == mode):
+                    continue
+            if path.exists() or path.is_symlink():
+                path.unlink()
+            path.write_text(content)
+            if mode is not None:
+                path.chmod(mode)
+            print(f"  file: {config_path}")
+        elif entry[0] == 'symlink':
+            target = entry[1]
+            if path.is_symlink() and os.readlink(path) == target:
+                continue
+            if path.exists() or path.is_symlink():
+                path.unlink()
+            path.symlink_to(target)
+            print(f"  symlink: {config_path}")
+
+        changed.add(config_path)
+    return changed
 
 
 def force_symlink(path: Path, target: str):
@@ -658,6 +681,10 @@ def build_generation(config: Config, ctx: BuildContext):
     - @var NOT mounted (we mount it after moving pacman db)
     - Partitions already formatted, subvolumes already created
     """
+    # Write config files before pacstrap so they exist for package install hooks
+    print("\n=== Writing config files (pre-pacstrap) ===")
+    write_config_files(ctx.mount_root, config.files)
+
     print("\n=== Installing base system with pacstrap ===")
     # Bind-mount host's package cache so pacstrap reads/writes there.
     # On non-darch host: uses host cache. On darch system: uses @var cache.
@@ -689,9 +716,7 @@ def build_generation(config: Config, ctx: BuildContext):
 
         # Apply config.files (locale.gen, mkinitcpio.conf, hooks needed by chroot commands)
         print("\n=== Applying config files ===")
-        for path, entry in config.files.items():
-            write_file_entry(ctx.mount_root / path[1:], entry)  # strip leading /
-            print(f"  {entry[0]}: {path}")
+        write_config_files(ctx.mount_root, config.files)
 
         print("\n=== Configuring system ===")
         chroot_run(ctx.mount_root, "hwclock", "--systohc")
@@ -755,31 +780,26 @@ def build_incremental(diff: ConfigDiff, ctx: BuildContext):
             chroot_run(ctx.mount_root, "pacman", "-Syu", "--noconfirm")
 
         # Apply changed files
-        all_file_changes = {**diff.files_to_add, **diff.files_to_update}
-        if all_file_changes:
-            print(f"\n=== Applying {len(all_file_changes)} file changes ===")
-            for path, entry in all_file_changes.items():
-                write_file_entry(ctx.mount_root / path[1:], entry)
-                print(f"  {entry[0]}: {path}")
+        files_to_write = {**diff.files_to_add, **diff.files_to_update}
+        print("\n=== Applying config files ===")
+        changed_files = write_config_files(ctx.mount_root, files_to_write)
 
         # Remove deleted files
-        if diff.files_to_remove:
-            print(f"\n=== Removing {len(diff.files_to_remove)} files ===")
-            for path in diff.files_to_remove:
-                full_path = ctx.mount_root / path[1:]
-                if full_path.exists() or full_path.is_symlink():
-                    full_path.unlink()
-                    print(f"  removed: {path}")
+        for path in diff.files_to_remove:
+            full_path = ctx.mount_root / path[1:]
+            if full_path.exists() or full_path.is_symlink():
+                full_path.unlink()
+                print(f"  removed: {path}")
 
         # Regenerate locale if locale.gen changed
-        if "/etc/locale.gen" in all_file_changes:
+        if "/etc/locale.gen" in changed_files:
             print("\n=== Regenerating locales ===")
             chroot_run(ctx.mount_root, "locale-gen")
 
         # Check if initramfs needs regeneration
         initramfs_paths = {"/etc/mkinitcpio.conf", "/usr/lib/initcpio/hooks/darch",
                            "/usr/lib/initcpio/install/darch"}
-        needs_initramfs = bool(set(all_file_changes.keys()) & initramfs_paths)
+        needs_initramfs = bool(changed_files & initramfs_paths)
 
         if needs_initramfs:
             print("\n=== Regenerating initramfs ===")
@@ -806,9 +826,40 @@ def lockfile():
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+def cleanup_stale_loops(image_path: Path):
+    """Detach any stale loop devices associated with this image (including deleted)."""
+    image_name = image_path.name
+    result = run(["losetup", "-a"], capture_output=True)
+    mounts = run(["mount"], capture_output=True)
+
+    # Find all loop devices for this image
+    loop_devs = []
+    for line in result.strip().split('\n'):
+        if line and image_name in line:
+            loop_devs.append(line.split(':')[0])
+
+    # Collect all mounts from these loop devices
+    devices_to_unmount = []
+    for mount_line in mounts.split('\n'):
+        for loop_dev in loop_devs:
+            if mount_line.startswith(loop_dev):
+                devices_to_unmount.append(mount_line.split(' on ')[0])
+
+    # Unmount in reverse order (last mounted first) - mount output is in mount order
+    for device in reversed(devices_to_unmount):
+        print(f"  Unmounting: {device}")
+        run(["umount", "-l", device], check=False)
+
+    # Detach loop devices
+    for loop_dev in loop_devs:
+        print(f"  Detaching stale loop device: {loop_dev}")
+        run(["losetup", "-d", loop_dev], check=False)
+
+
 @contextmanager
 def loop_device(image_path: Path) -> Iterator[Tuple[Path, Path]]:
     """Loop-mount a disk image, yield (esp_part, btrfs_part)."""
+    cleanup_stale_loops(image_path)
     loop = run(["losetup", "-Pf", "--show", image_path], capture_output=True)
     run(["udevadm", "settle"])
     try:

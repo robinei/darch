@@ -2,27 +2,6 @@
 from darch import Config, User
 
 
-def enable_sway(config: Config, user: User):
-    """Adds sway and associated packages."""
-    config.add_packages("sway", "foot", "mesa", "xorg-xwayland")
-    config.enable_service("seatd")
-    user.add_groups("seat")
-
-
-def enable_fish(config: Config, user: User):
-    """Enable the fish shell."""
-    config.add_packages("fish")
-    user.shell = "/usr/bin/fish"
-
-
-def enable_sudo(config: Config, *users: User):
-    """Enable sudo for the given users via the wheel group."""
-    config.add_packages("sudo")
-    config.add_file("/etc/sudoers.d/wheel", "%wheel ALL=(ALL:ALL) ALL\n", mode=0o440)
-    for user in users:
-        user.add_groups("wheel")
-
-
 def configure() -> Config:
     """Configuration entry point."""
     config = Config()
@@ -41,17 +20,18 @@ def configure() -> Config:
 
     # Packages
     config.add_packages(
+        "base-devel",
         "linux",
         "strace",
         "htop",
         "btop",
-        "helix",
     )
 
     config.enable_qemu_testing()
-    enable_sudo(config, user)
-    enable_sway(config, user)
-    enable_fish(config, user)
+    enable_sudo(config, [user])
+    enable_sway(config, [user])
+    enable_fish(config, [user])
+    enable_helix(config)
 
     # Services
     config.enable_service("serial-getty@ttyS0")
@@ -61,3 +41,33 @@ def configure() -> Config:
     config.mask_service("systemd-userdbd.socket")
 
     return config
+
+
+def enable_helix(config: Config):
+    """Enable the Helix editor."""
+    config.add_packages("helix")
+    config.add_symlink("/usr/local/bin/hx", "/usr/bin/helix")
+
+
+def enable_sway(config: Config, users: list[User]):
+    """Adds sway and associated packages."""
+    config.add_packages("sway", "foot", "mesa", "xorg-xwayland")
+    config.enable_service("seatd")
+    for user in users:
+        user.add_groups("seat")
+
+
+def enable_fish(config: Config, users: list[User]):
+    """Enable the fish shell."""
+    config.add_packages("fish", "pkgfile")
+    for user in users:
+        user.shell = "/usr/bin/fish"
+
+
+def enable_sudo(config: Config, users: list[User]):
+    """Enable sudo for the given users via the wheel group."""
+    config.add_packages("sudo")
+    config.add_file("/etc/sudoers.d/wheel", "%wheel ALL=(ALL:ALL) ALL\n", mode=0o440)
+    for user in users:
+        user.add_groups("wheel")
+
