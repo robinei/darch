@@ -15,6 +15,14 @@ def enable_fish(config: Config, user: User):
     user.shell = "/usr/bin/fish"
 
 
+def enable_sudo(config: Config, *users: User):
+    """Enable sudo for the given users via the wheel group."""
+    config.add_packages("sudo")
+    config.add_file("/etc/sudoers.d/wheel", "%wheel ALL=(ALL:ALL) ALL\n", mode=0o440)
+    for user in users:
+        user.add_groups("wheel")
+
+
 def configure() -> Config:
     """Configuration entry point."""
     config = Config()
@@ -27,7 +35,7 @@ def configure() -> Config:
 
     # Users
     password_hash="$6$bxSIgU/AEruP0HSu$UCk/mosb6FkwuJ556RZn.CHQy1Ys4cFmFVikf5a5QvTo4EO8HGXLFvRHLJdE.QMjFptVAqY/EzwVkYjA7vwwX1"
-    user = User("robin", groups={"wheel"}, password_hash=password_hash)
+    user = User("robin", password_hash=password_hash)
     root = User("root", uid=0, password_hash=password_hash)
     config.users = [user, root]
 
@@ -41,6 +49,7 @@ def configure() -> Config:
     )
 
     config.enable_qemu_testing()
+    enable_sudo(config, user)
     enable_sway(config, user)
     enable_fish(config, user)
 
