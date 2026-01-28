@@ -39,7 +39,8 @@ gen-N/
 ├── boot/                   kernel + initramfs
 ├── pacman/                 full pacman state (local + sync DBs)
 ├── current -> .            self-reference for build-time compatibility
-└── config.json             serialized Config for diffing
+├── config.json             serialized Config for diffing
+└── build-info.json         build metadata (fresh/incremental, package count)
 ```
 
 ### Btrfs Subvolumes
@@ -91,6 +92,8 @@ New generations are created as btrfs snapshots of the previous, making increment
 
 Users are declared in config via the `User` class and added to `config.users`. User files (`/etc/passwd`, `/etc/shadow`, etc.) are written directly to the generation's /etc directory at build time. This keeps users immutable per generation, consistent with the declarative design. Home directories are created in @home (persistent). Missing groups are created automatically.
 
+Users can also declare files and symlinks for their home directory via `add_file()` and `add_symlink()`. Paths must start with `~`. These are written on every build (write-only, never removes).
+
 ```python
 user = User("robin", groups={"wheel"})
 root = User("root", uid=0, password_hash="$6$...")
@@ -100,7 +103,17 @@ config.users = [user, root]
 def enable_sway(config: Config, user: User):
     config.add_packages("sway", "foot")
     user.add_groups("seat")
+    user.add_file("~/.config/sway/config", "set $mod Mod4\n...")
+    user.add_symlink("~/.bashrc", "/usr/share/defaults/bashrc")
 ```
+
+### Live Switching
+
+When running on a booted darch system, `--switch` atomically updates the `/current` symlink to point to the newly built generation. Since `/usr`, `/etc`, etc. are all symlinks through `/current`, the system immediately uses the new generation's files.
+
+The switch uses `rename()` for atomicity. Kernel and initramfs changes require a reboot since those are loaded at boot time.
+
+Auto-detection: When no `--image` or `--btrfs`/`--esp` is specified, darch detects it's running on a darch system by checking if `/current` is a symlink to `images/gen-*`, then finds device paths from `/proc/mounts`.
 
 ### Initramfs Hook
 
@@ -162,15 +175,19 @@ sudo ./darch.py apply --image myvm.img --config config.py --rebuild
 # Upgrade all packages
 sudo ./darch.py apply --image myvm.img --config config.py --upgrade
 
-# Boot image in QEMU for testing (no root needed)
+# Boot image in QEMU for testing (no root needed, has networking)
 ./darch.py test myvm.img                      # serial console
 ./darch.py test myvm.img --graphics           # graphical (virtio-gpu)
 ./darch.py test myvm.img --memory 8G --cpus 4
+
+# On a booted darch system: auto-detects devices, builds, and live-switches
+sudo ./darch.py apply --switch
+sudo ./darch.py apply --upgrade --switch
 ```
 
 ## GRUB
 
-GRUB config lists all generations with creation timestamps, newest first. Each entry loads the kernel directly from the btrfs subvolume with the generation number as a kernel parameter.
+GRUB config lists all generations with creation timestamps, newest first. Each entry shows build info: `gen-N, 2026-01-28 12:00, rebuild, 150 pkgs` or `incremental, 150 pkgs`. Each entry loads the kernel directly from the btrfs subvolume with the generation number as a kernel parameter.
 
 ## Transactional Builds
 
