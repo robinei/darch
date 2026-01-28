@@ -1,4 +1,5 @@
 """My Arch configuration."""
+from pathlib import Path
 from darch import Config, User
 
 
@@ -32,6 +33,7 @@ def configure() -> Config:
     enable_sway(config, [user])
     enable_fish(config, [user])
     enable_helix(config)
+    copy_darch_files([user, root])
 
     # Services
     config.enable_service("serial-getty@ttyS0")
@@ -78,3 +80,11 @@ def enable_sudo(config: Config, users: list[User]):
     config.add_file("/etc/sudoers.d/wheel", "%wheel ALL=(ALL:ALL) ALL\n", mode=0o440)
     for user in users:
         user.add_groups("wheel")
+
+
+def copy_darch_files(users: list[User], darch_dir: Path = Path(__file__).parent):
+    """Copy darch .py files to users' home directories for in-image testing."""
+    for py_file in darch_dir.glob("*.py"):
+        content = py_file.read_text()
+        for user in users:
+            user.add_file(f"~/darch/{py_file.name}", content)

@@ -867,6 +867,52 @@ def build_incremental(diff: ConfigDiff, ctx: BuildContext):
             chroot_run(ctx.mount_root, "mkinitcpio", "-P")
 
 
+def detect_darch_system() -> tuple[Path, Path] | None:
+    """
+    Detect if running on a darch system and return (btrfs_dev, esp_dev).
+
+    Returns None if not running on darch.
+    """
+    current = Path("/current")
+    if not current.is_symlink():
+        return None
+
+    target = os.readlink(current)
+    if not target.startswith("images/gen-"):
+        return None
+
+    # Parse /proc/mounts to find devices
+    btrfs_dev = None
+    esp_dev = None
+    with open("/proc/mounts") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3:
+                device, mountpoint, fstype = parts[0], parts[1], parts[2]
+                if mountpoint == "/images" and fstype == "btrfs":
+                    btrfs_dev = Path(device)
+                elif mountpoint == "/efi" and fstype == "vfat":
+                    esp_dev = Path(device)
+
+    if btrfs_dev and esp_dev:
+        return btrfs_dev, esp_dev
+    return None
+
+
+def switch_generation(new_gen: int):
+    """Switch the running system to a new generation by updating /current symlink."""
+    current = Path("/current")
+    new_target = f"images/gen-{new_gen}"
+
+    # Atomically replace symlink
+    tmp_link = Path("/current.new")
+    if tmp_link.exists() or tmp_link.is_symlink():
+        tmp_link.unlink()
+    tmp_link.symlink_to(new_target)
+    tmp_link.rename(current)
+    print(f"Switched /current -> {new_target}")
+
+
 # =============================================================================
 # Context managers
 # =============================================================================
@@ -1126,6 +1172,7 @@ def apply_configuration(
     esp_dev: Path | None,
     upgrade: bool,
     rebuild: bool,
+    switch: bool,
 ) -> int:
     """Applies the provided config to the system found in 'image' or 'btrfs'/'esp'"""
     with ExitStack() as stack:
@@ -1135,13 +1182,25 @@ def apply_configuration(
             print("Error: Could not load configuration.")
             return 1
 
+        on_darch = False
         if image_path:
             if btrfs_dev is not None or esp_dev is not None:
                 print("Error: --btrfs and --esp not supported in combination with --image")
                 return 1
             esp_dev, btrfs_dev = stack.enter_context(image_file(image_path, image_size))
+        elif btrfs_dev is None and esp_dev is None:
+            # Try auto-detection on darch system
+            detected = detect_darch_system()
+            if detected:
+                btrfs_dev, esp_dev = detected
+                on_darch = True
+                print(f"Detected darch system: btrfs={btrfs_dev}, esp={esp_dev}")
+            else:
+                print("Error: --image or (--btrfs and --esp) required")
+                print("       (or run on a booted darch system for auto-detection)")
+                return 1
         elif btrfs_dev is None or esp_dev is None:
-            print("Error: --image or (--btrfs and --esp) required")
+            print("Error: --btrfs and --esp must both be specified")
             return 1
 
         images = stack.enter_context(mount(btrfs_dev, Path("/mnt/darch-images"), "subvol=@images"))
@@ -1226,6 +1285,16 @@ def apply_configuration(
         grub_cfg.write_text(generate_grub_config(ctx.root_uuid, complete_gens))
 
         print(f"\n=== SUCCESS: Built gen-{new_gen} ===")
+
+        # Live switch if requested and running on darch
+        if switch:
+            if on_darch:
+                print("\n=== Switching to new generation ===")
+                switch_generation(new_gen)
+                print("Note: Kernel/initramfs changes require reboot")
+            else:
+                print("Note: --switch ignored (not running on darch system)")
+
     return 0
 
 
@@ -1339,6 +1408,7 @@ def main() -> int:
     p_apply.add_argument("--esp", help="ESP device (e.g., /dev/nvme0n1p1)", type=path_type)
     p_apply.add_argument("--upgrade", action="store_true", help="Also upgrade all packages (pacman -Syu)")
     p_apply.add_argument("--rebuild", action="store_true", help="Force fresh build even if generations exist")
+    p_apply.add_argument("--switch", action="store_true", help="Switch to new generation after build (on darch systems)")
 
     # test command
     p_test = subparsers.add_parser("test", help="Boot an image in QEMU for testing")
@@ -1371,6 +1441,7 @@ def main() -> int:
             esp_dev = args.esp,
             upgrade = args.upgrade,
             rebuild = args.rebuild,
+            switch = args.switch,
         )
 
     parser.print_help()
