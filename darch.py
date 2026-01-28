@@ -56,10 +56,30 @@ class User:
     shell: str = "/bin/bash"
     password_hash: str | None = None
     groups: Set[str] = field(default_factory=set)
+    files: Dict[str, FileEntry | SymlinkEntry] = field(default_factory=dict)
+
+    def _validate_path(self, path: str) -> None:
+        """Validate a user file path."""
+        if not path.startswith("~"):
+            raise ValueError(f"User file path must start with '~': {path}")
+        if ".." in path:
+            raise ValueError(f"User file path cannot contain '..': {path}")
 
     def add_groups(self, *names: str) -> "User":
         """Add groups to the user."""
         self.groups.update(names)
+        return self
+
+    def add_file(self, path: str, content: str, mode: int | None = None) -> User:
+        """Add a file to the user's home directory. Path must start with ~."""
+        self._validate_path(path)
+        self.files[path] = ('file', content, mode)
+        return self
+
+    def add_symlink(self, path: str, target: str) -> User:
+        """Add a symlink in the user's home directory. Path must start with ~."""
+        self._validate_path(path)
+        self.files[path] = ('symlink', target)
         return self
 
     def to_dict(self) -> dict:
@@ -70,6 +90,7 @@ class User:
             "shell": self.shell,
             "password_hash": self.password_hash,
             "groups": sorted(self.groups),
+            "files": {k: list(v) for k, v in self.files.items()},
         }
 
     @classmethod
@@ -80,6 +101,7 @@ class User:
         user.shell = data.get("shell", "/bin/bash")
         user.password_hash = data.get("password_hash")
         user.groups = set(data.get("groups", []))
+        user.files = {k: tuple(v) for k, v in data.get("files", {}).items()}
         return user
 
 
@@ -556,6 +578,45 @@ def configure_users(users: list[User], gen_root: Path, home_path: Path):
             user_home.chmod(0o700)
             os.chown(user_home, user.uid, user.uid)
             print(f"  Created home directory: {user_home}")
+
+    # Write user files to home directories
+    for user in users:
+        if not user.files:
+            continue
+        user_home = home_path / user.name
+        for file_path, entry in user.files.items():
+            # Expand ~ to user's home directory
+            rel_path = file_path[2:] if file_path.startswith("~/") else file_path[1:]
+            path = user_home / rel_path
+
+            # Create parent directories with user ownership
+            if not path.parent.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                # Walk up and chown all created directories
+                for parent in [path.parent] + list(path.parent.parents):
+                    if parent == user_home or not str(parent).startswith(str(user_home)):
+                        break
+                    os.chown(parent, user.uid, user.uid)
+
+            if entry[0] == 'file':
+                content, mode = entry[1], entry[2]
+                path.write_text(content)
+                if mode is not None:
+                    path.chmod(mode)
+                os.chown(path, user.uid, user.uid)
+                print(f"  {user.name}: {file_path}")
+            elif entry[0] == 'symlink':
+                target = entry[1]
+                # Expand ~ in symlink target
+                if target.startswith("~/"):
+                    target = str(user_home / target[2:])
+                elif target.startswith("~"):
+                    target = str(user_home / target[1:])
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+                path.symlink_to(target)
+                os.lchown(path, user.uid, user.uid)
+                print(f"  {user.name}: {file_path} -> {target}")
 
 
 # =============================================================================

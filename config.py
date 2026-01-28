@@ -55,6 +55,14 @@ def enable_sway(config: Config, users: list[User]):
     config.enable_service("seatd")
     for user in users:
         user.add_groups("seat")
+        user.add_file("~/.config/sway/config", """\
+set $mod Mod4
+set $term foot
+bindsym $mod+Return exec $term
+bindsym $mod+Shift+q kill
+bindsym $mod+d exec wmenu-run
+bindsym $mod+Shift+e exec swaynag -t warning -m 'Exit sway?' -B 'Yes' 'swaymsg exit'
+""")
 
 
 def enable_fish(config: Config, users: list[User]):
@@ -70,4 +78,3 @@ def enable_sudo(config: Config, users: list[User]):
     config.add_file("/etc/sudoers.d/wheel", "%wheel ALL=(ALL:ALL) ALL\n", mode=0o440)
     for user in users:
         user.add_groups("wheel")
-
