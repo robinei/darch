@@ -277,6 +277,25 @@ class Config:
 
 
 @dataclass
+class BuildInfo:
+    """Metadata about how a generation was built."""
+    fresh: bool                 # True if full rebuild, False if incremental
+    package_count: int = 0      # Total packages in generation
+
+    def to_dict(self) -> dict:
+        return {"fresh": self.fresh, "package_count": self.package_count}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "BuildInfo":
+        return cls(fresh=data.get("fresh", True), package_count=data.get("package_count", 0))
+
+    def summary(self) -> str:
+        """Compact summary like 'rebuild, 150 pkgs' or 'incremental, 150 pkgs'."""
+        build_type = "rebuild" if self.fresh else "incremental"
+        return f"{build_type}, {self.package_count} pkgs"
+
+
+@dataclass
 class GenerationInfo:
     """Info about a generation.
 
@@ -287,6 +306,7 @@ class GenerationInfo:
     path: Path
     complete: bool              # True if config.json exists
     created_at: float | None    # Unix timestamp (None if incomplete)
+    build_info: BuildInfo | None = None
 
 
 # =============================================================================
@@ -477,8 +497,9 @@ search --set=root --fs-uuid {root_uuid}
         if not g.complete or g.created_at is None:
             continue
         created_str = datetime.fromtimestamp(g.created_at).strftime("%Y-%m-%d %H:%M")
+        build_str = f", {g.build_info.summary()}" if g.build_info else ""
         entries.append(f"""
-menuentry "Arch Linux (gen-{g.gen}, {created_str})" {{
+menuentry "Arch Linux (gen-{g.gen}, {created_str}{build_str})" {{
     linux /@images/gen-{g.gen}/boot/vmlinuz-linux \\
         root=UUID={root_uuid} \\
         darch.gen={g.gen} \\
@@ -730,6 +751,12 @@ def check_upgrades_available(mount_root: Path) -> bool:
         return True
     except subprocess.CalledProcessError:
         return False
+
+
+def count_packages(mount_root: Path) -> int:
+    """Count installed packages in a generation."""
+    output = chroot_run(mount_root, "pacman", "--dbpath", "/pacman", "-Q", capture_output=True)
+    return len(output.strip().split('\n')) if output.strip() else 0
 
 
 def build_generation(config: Config, ctx: BuildContext):
@@ -1058,13 +1085,21 @@ def get_generations(images: Path) -> list[GenerationInfo]:
             continue
         gen = int(p.name[4:])
         config_path = p / "config.json"
+        build_info = None
         if config_path.exists():
             created_at = config_path.stat().st_ctime
             complete = True
+            # Load build info if present
+            build_info_path = p / "build-info.json"
+            if build_info_path.exists():
+                try:
+                    build_info = BuildInfo.from_dict(json.loads(build_info_path.read_text()))
+                except (json.JSONDecodeError, KeyError):
+                    pass
         else:
             created_at = None
             complete = False
-        result.append(GenerationInfo(gen=gen, path=p, complete=complete, created_at=created_at))
+        result.append(GenerationInfo(gen=gen, path=p, complete=complete, created_at=created_at, build_info=build_info))
     return sorted(result, key=lambda g: g.gen)
 
 
@@ -1277,9 +1312,11 @@ def apply_configuration(
             with mount(ctx.btrfs_dev, home_mount, "subvol=@home"):
                 configure_users(config.users, ctx.mount_root, home_mount)
 
-        # Save config
+        # Save config and build info
         print("\n=== Saving config ===")
         (ctx.mount_root / "config.json").write_text(config.to_json())
+        build_info = BuildInfo(fresh=fresh, package_count=count_packages(ctx.mount_root))
+        (ctx.mount_root / "build-info.json").write_text(json.dumps(build_info.to_dict()))
 
         # Write GRUB config with all complete generations
         print("\n=== Writing GRUB config ===")
