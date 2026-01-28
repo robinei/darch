@@ -827,7 +827,11 @@ def build_incremental(diff: ConfigDiff, ctx: BuildContext):
     # Generation already has /pacman_local and /current -> . from previous build
     # Mount @var so pacman can find its database via the symlink
     with mount(ctx.btrfs_dev, ctx.var_path, "subvol=@var"):
-        # Package changes
+        # Package changes - sync database first if installing or upgrading
+        if diff.packages_to_install or ctx.upgrade:
+            print("\n=== Syncing package database ===")
+            chroot_run(ctx.mount_root, "pacman", "-Sy")
+
         if diff.packages_to_remove:
             print(f"\n=== Removing packages: {diff.packages_to_remove} ===")
             chroot_run(ctx.mount_root, "pacman", "-Rns", "--noconfirm", *sorted(diff.packages_to_remove))
@@ -838,7 +842,7 @@ def build_incremental(diff: ConfigDiff, ctx: BuildContext):
 
         if ctx.upgrade:
             print("\n=== Upgrading system packages ===")
-            chroot_run(ctx.mount_root, "pacman", "-Syu", "--noconfirm")
+            chroot_run(ctx.mount_root, "pacman", "-Su", "--noconfirm")
 
         # Apply changed files
         files_to_write = {**diff.files_to_add, **diff.files_to_update}
@@ -1352,7 +1356,8 @@ def test_image(
         "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
         "-drive", f"if=pflash,format=raw,file={vars_copy.name}",
         "-drive", f"file={image_path},format=raw",
-        "-net", "none",
+        "-netdev", "user,id=net0",
+        "-device", "virtio-net-pci,netdev=net0",
         "-usb",
         "-device", "usb-tablet",
     ]

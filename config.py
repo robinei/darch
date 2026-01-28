@@ -26,6 +26,7 @@ def configure() -> Config:
         "strace",
         "htop",
         "btop",
+        "less",
     )
 
     config.enable_qemu_testing()
@@ -33,6 +34,7 @@ def configure() -> Config:
     enable_sway(config, [user])
     enable_fish(config, [user])
     enable_helix(config)
+    enable_network(config)
     copy_darch_files([user, root])
 
     # Services
@@ -80,6 +82,19 @@ def enable_sudo(config: Config, users: list[User]):
     config.add_file("/etc/sudoers.d/wheel", "%wheel ALL=(ALL:ALL) ALL\n", mode=0o440)
     for user in users:
         user.add_groups("wheel")
+
+
+def enable_network(config: Config):
+    """Enable systemd-networkd with DHCP for all ethernet interfaces."""
+    config.enable_service("systemd-networkd")
+    config.enable_service("systemd-resolved")
+    config.add_file("/etc/systemd/network/20-wired.network", """\
+[Match]
+Type=ether
+
+[Network]
+DHCP=yes
+""")
 
 
 def copy_darch_files(users: list[User], darch_dir: Path = Path(__file__).parent):
