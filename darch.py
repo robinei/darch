@@ -749,8 +749,14 @@ def check_upgrades_available(mount_root: Path) -> bool:
     try:
         chroot_run(mount_root, "checkupdates", capture_output=True)
         return True
-    except subprocess.CalledProcessError:
-        return False
+    except subprocess.CalledProcessError as e:
+        if e.returncode == 2:
+            return False  # No updates available
+        # Exit code 1 = unknown failure
+        print(f"Warning: checkupdates failed (exit code {e.returncode})")
+        if e.stderr:
+            print(f"  {e.stderr.strip()}")
+        raise
 
 
 def count_packages(mount_root: Path) -> int:
@@ -1094,8 +1100,8 @@ def get_generations(images: Path) -> list[GenerationInfo]:
             if build_info_path.exists():
                 try:
                     build_info = BuildInfo.from_dict(json.loads(build_info_path.read_text()))
-                except (json.JSONDecodeError, KeyError):
-                    pass
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"Warning: Failed to parse {build_info_path}: {e}")
         else:
             created_at = None
             complete = False
@@ -1188,12 +1194,26 @@ def load_gen_config(gen_path: Path) -> Config | None:
 
 def load_config_module(config_path: Path) -> Config | None:
     """Load config.py and call configure()."""
+    if not config_path.exists():
+        print(f"Error: Config file not found: {config_path}")
+        return None
+
     spec = importlib.util.spec_from_file_location("config", config_path)
     if spec is None or spec.loader is None:
+        print(f"Error: Could not load config module: {config_path}")
         return None
-        
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:
+        print(f"Error: Failed to execute config module: {e}")
+        return None
+
+    if not hasattr(module, "configure"):
+        print(f"Error: Config module missing configure() function: {config_path}")
+        return None
+
     config = module.configure()
 
     # Add darch-specific files
