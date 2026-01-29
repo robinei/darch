@@ -36,6 +36,11 @@ GC_MIN_AGE_DAYS = 7      # Never delete generations younger than this
 GC_MAX_AGE_DAYS = 30     # Delete generations older than this (0 = keep forever)
 
 
+class CriticalError(Exception):
+    """Error which should be propagated all the way out of main()
+    and simply printed before exiting with exit code 1."""
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -700,19 +705,12 @@ def run(cmd, check=True, capture_output=False) -> str:
     env["LC_ALL"] = "C"
 
     cmd_str = ' '.join(str(c) for c in cmd)
-    print(f"Running: {cmd_str}")
-    try:
-        if capture_output:
-            result = subprocess.run(cmd, check=check, capture_output=True, text=True, env=env)
-            return result.stdout.strip()
-        subprocess.run(cmd, check=check, env=env)
-        return ""
-    except subprocess.CalledProcessError as e:
-        print(f"\nError: Command failed: {cmd_str}")
-        print(f"Exit code: {e.returncode}")
-        if e.stderr:
-            print(f"stderr:\n{e.stderr}")
-        raise
+    #print(f"Running: {cmd_str}")
+    if capture_output:
+        result = subprocess.run(cmd, check=check, capture_output=True, text=True, env=env)
+        return result.stdout.strip()
+    subprocess.run(cmd, check=check, env=env)
+    return ""
 
 
 def chroot_run(root: Path, *cmd, check=True, capture_output=False) -> str | None:
@@ -783,13 +781,10 @@ def get_available_upgrades(mount_root: Path) -> list[str]:
     try:
         output = chroot_run(mount_root, "checkupdates", capture_output=True)
         return output.strip().split('\n') if output.strip() else []
-    except subprocess.CalledProcessError as e:
-        if e.returncode == 2:
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 2:
             return []  # No updates available
         # Exit code 1 = unknown failure
-        print(f"Warning: checkupdates failed (exit code {e.returncode})")
-        if e.stderr:
-            print(f"  {e.stderr.strip()}")
         raise
 
 
@@ -997,16 +992,18 @@ def switch_generation(new_gen: int):
 def lockfile():
     """Acquire exclusive lock to prevent concurrent darch runs."""
     LOCKFILE.parent.mkdir(parents=True, exist_ok=True)
+    held = False
     with open(LOCKFILE, "w", encoding='utf-8') as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print(f"Error: Another darch process is running (lockfile: {LOCKFILE})")
-            sys.exit(1)
+            held = True
+        except BlockingIOError as exc:
+            raise CriticalError(f"Another darch process is running (lockfile: {LOCKFILE})") from exc
         try:
             yield
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            if held:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def cleanup_stale_loops(image_path: Path):
@@ -1057,7 +1054,7 @@ def mount(device: Path, mount_point: Path, options: str | None = None, bind: boo
     """Mount a filesystem, yield mount point as Path."""
     mount_point.mkdir(parents=True, exist_ok=True)
     # Ensure not already mounted from a previous failed run
-    run(["umount", mount_point], check=False)
+    run(["umount", "-q", mount_point], check=False)
     cmd: list[str | Path] = ["mount"]
     if bind:
         cmd.append("--bind")
@@ -1137,10 +1134,7 @@ def get_generations(images: Path) -> list[GenerationInfo]:
             # Load build info if present
             build_info_path = p / "build-info.json"
             if build_info_path.exists():
-                try:
-                    build_info = BuildInfo.from_dict(json.loads(build_info_path.read_text()))
-                except (json.JSONDecodeError, KeyError) as e:
-                    print(f"Warning: Failed to parse {build_info_path}: {e}")
+                build_info = BuildInfo.from_dict(json.loads(build_info_path.read_text()))
         else:
             created_at = None
             complete = False
@@ -1231,27 +1225,23 @@ def load_gen_config(gen_path: Path) -> Config | None:
     return Config.from_json(config_file.read_text())
 
 
-def load_config_module(config_path: Path) -> Config | None:
+def load_config_module(config_path: Path) -> Config:
     """Load config.py and call configure()."""
     if not config_path.exists():
-        print(f"Error: Config file not found: {config_path}")
-        return None
+        raise CriticalError(f"Config file not found: {config_path}")
 
     spec = importlib.util.spec_from_file_location("config", config_path)
     if spec is None or spec.loader is None:
-        print(f"Error: Could not load config module: {config_path}")
-        return None
+        raise CriticalError(f"Could not load config module: {config_path}")
 
     try:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-    except Exception as e:
-        print(f"Error: Failed to execute config module: {e}")
-        return None
+    except Exception as exc:
+        raise CriticalError(f"Failed to execute config module: {exc}") from exc
 
     if not hasattr(module, "configure"):
-        print(f"Error: Config module missing configure() function: {config_path}")
-        return None
+        raise CriticalError(f"Config module missing configure() function: {config_path}")
 
     config = module.configure()
 
@@ -1276,15 +1266,11 @@ def apply_configuration(
     with ExitStack() as stack:
         stack.enter_context(lockfile())
         config = load_config_module(config_path)
-        if config is None:
-            print("Error: Could not load configuration.")
-            return 1
 
         on_darch = False
         if image_path:
             if btrfs_dev is not None or esp_dev is not None:
-                print("Error: --btrfs and --esp not supported in combination with --image")
-                return 1
+                raise CriticalError("--btrfs and --esp not supported in combination with --image")
             esp_dev, btrfs_dev = stack.enter_context(image_file(image_path, image_size))
         elif btrfs_dev is None and esp_dev is None:
             # Try auto-detection on darch system
@@ -1294,12 +1280,9 @@ def apply_configuration(
                 on_darch = True
                 print(f"Detected darch system: btrfs={btrfs_dev}, esp={esp_dev}")
             else:
-                print("Error: --image or (--btrfs and --esp) required")
-                print("       (or run on a booted darch system for auto-detection)")
-                return 1
+                raise CriticalError("--image or (--btrfs and --esp) required (or run on a booted darch system for auto-detection)")
         elif btrfs_dev is None or esp_dev is None:
-            print("Error: --btrfs and --esp must both be specified")
-            return 1
+            raise CriticalError("--btrfs and --esp must both be specified")
 
         images = stack.enter_context(mount(btrfs_dev, Path("/mnt/darch-images"), "subvol=@images"))
 
@@ -1330,7 +1313,7 @@ def apply_configuration(
                     diff = ConfigDiff.compute(old_config, config)
                     if not diff.has_changes() and not (upgrade and check_upgrades_available(old_gen)):
                         print("Already up to date.")
-                        return 0
+                        return
 
         # Create and mount new generation
         create_gen_subvol(images, new_gen, snapshot_from=None if fresh else current)
@@ -1395,8 +1378,6 @@ def apply_configuration(
             else:
                 print("Note: --switch ignored (not running on darch system)")
 
-    return 0
-
 
 def check_configuration(
     config_path: Path,
@@ -1408,25 +1389,19 @@ def check_configuration(
     """Check what would change without building (dry-run mode)."""
     with ExitStack() as stack:
         config = load_config_module(config_path)
-        if config is None:
-            print("Error: Could not load configuration.")
-            return 1
 
         if image_path:
             if btrfs_dev is not None or esp_dev is not None:
-                print("Error: --btrfs and --esp not supported in combination with --image")
-                return 1
+                raise CriticalError("--btrfs and --esp not supported in combination with --image")
             esp_dev, btrfs_dev = stack.enter_context(loop_device(image_path))
         elif btrfs_dev is None and esp_dev is None:
             detected = detect_darch_system()
             if detected:
                 btrfs_dev, esp_dev = detected
             else:
-                print("Error: --image or (--btrfs and --esp) required")
-                return 1
+                raise CriticalError("--image or (--btrfs and --esp) required")
         elif btrfs_dev is None or esp_dev is None:
-            print("Error: --btrfs and --esp must both be specified")
-            return 1
+            raise CriticalError("--btrfs and --esp must both be specified")
 
         images = stack.enter_context(mount(btrfs_dev, Path("/mnt/darch-images"), "subvol=@images"))
 
@@ -1442,7 +1417,7 @@ def check_configuration(
             print(f"\nFiles to create ({len(config.files)}):")
             for path in sorted(config.files):
                 print(f"  + {path}")
-            return 0
+            return
 
         current = complete_gens[-1]
 
@@ -1456,7 +1431,7 @@ def check_configuration(
             old_config = load_gen_config(old_gen)
             if old_config is None:
                 print(f"gen-{current.gen} has no config.json. A fresh build would be performed.")
-                return 0
+                return
 
             diff = ConfigDiff.compute(old_config, config)
             diff.print_summary()
@@ -1475,8 +1450,6 @@ def check_configuration(
                 print("\nAlready up to date. No build needed.")
             else:
                 print(f"\nA new generation (gen-{current.gen + 1}) would be built.")
-
-    return 0
 
 
 def find_ovmf() -> tuple[Path, Path] | None:
@@ -1500,19 +1473,14 @@ def test_image(
 ) -> int:
     """Boot an image in QEMU for testing."""
     if not image_path.exists():
-        print(f"Error: Image file '{image_path}' not found")
-        return 1
+        raise CriticalError(f"Image file '{image_path}' not found")
 
     if not shutil.which("qemu-system-x86_64"):
-        print("Error: qemu-system-x86_64 not found")
-        print("Install with: sudo pacman -S qemu-full")
-        return 1
+        raise CriticalError("qemu-system-x86_64 not found. Install with: sudo pacman -S qemu-full")
 
     ovmf = find_ovmf()
     if not ovmf:
-        print("Error: OVMF firmware not found")
-        print("Install with: sudo pacman -S edk2-ovmf")
-        return 1
+        raise CriticalError("Error: OVMF firmware not found. Install with: sudo pacman -S edk2-ovmf")
 
     ovmf_code, ovmf_vars = ovmf
     print(f"Starting QEMU with image: {image_path}")
@@ -1565,10 +1533,8 @@ def test_image(
     finally:
         Path(vars_copy.name).unlink(missing_ok=True)
 
-    return 0
 
-
-def main() -> int:
+def main():
     """Darch entry point."""
     parser = argparse.ArgumentParser(
         description="darch - Declarative Arch Linux image builder",
@@ -1610,42 +1576,50 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "test":
-        return test_image(
+        test_image(
             image_path = args.image,
             memory = args.memory,
             cpus = args.cpus,
             graphics = args.graphics,
         )
+    else:
+        # Commands below require root
+        if os.geteuid() != 0:
+            raise CriticalError("This command must be run as root")
 
-    # Commands below require root
-    if os.geteuid() != 0:
-        print("Error: This command must be run as root")
-        return 1
-
-    if args.command == "apply":
-        return apply_configuration(
-            config_path = args.config,
-            image_path = args.image,
-            image_size = args.size,
-            btrfs_dev = args.btrfs,
-            esp_dev = args.esp,
-            upgrade = args.upgrade,
-            rebuild = args.rebuild,
-            switch = args.switch,
-        )
-
-    if args.command == "check":
-        return check_configuration(
-            config_path = args.config,
-            image_path = args.image,
-            btrfs_dev = args.btrfs,
-            esp_dev = args.esp,
-            upgrade = args.upgrade,
-        )
-
-    parser.print_help()
-    return 1
+        if args.command == "apply":
+            apply_configuration(
+                config_path = args.config,
+                image_path = args.image,
+                image_size = args.size,
+                btrfs_dev = args.btrfs,
+                esp_dev = args.esp,
+                upgrade = args.upgrade,
+                rebuild = args.rebuild,
+                switch = args.switch,
+            )
+        elif args.command == "check":
+            check_configuration(
+                config_path = args.config,
+                image_path = args.image,
+                btrfs_dev = args.btrfs,
+                esp_dev = args.esp,
+                upgrade = args.upgrade,
+            )
+        else:
+            parser.print_help()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        main()
+        sys.exit(0)
+    except CriticalError as exc:
+        print(f"\nError: {exc}")
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        print(f"\nError: Command failed: {exc.cmd}")
+        print(f"Exit code: {exc.returncode}")
+        if exc.stderr:
+            print(f"stderr:\n{exc.stderr}")
+        sys.exit(1)
