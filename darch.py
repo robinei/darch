@@ -141,6 +141,40 @@ class ConfigDiff:
             self.users_changed
         )
 
+    def print_summary(self):
+        """Print a human-readable summary of changes."""
+        if not self.has_changes():
+            print("No configuration changes.")
+            return
+
+        if self.packages_to_install:
+            print(f"\nPackages to install ({len(self.packages_to_install)}):")
+            for pkg in sorted(self.packages_to_install):
+                print(f"  + {pkg}")
+
+        if self.packages_to_remove:
+            print(f"\nPackages to remove ({len(self.packages_to_remove)}):")
+            for pkg in sorted(self.packages_to_remove):
+                print(f"  - {pkg}")
+
+        if self.files_to_add:
+            print(f"\nFiles to add ({len(self.files_to_add)}):")
+            for path in sorted(self.files_to_add):
+                print(f"  + {path}")
+
+        if self.files_to_update:
+            print(f"\nFiles to update ({len(self.files_to_update)}):")
+            for path in sorted(self.files_to_update):
+                print(f"  ~ {path}")
+
+        if self.files_to_remove:
+            print(f"\nFiles to remove ({len(self.files_to_remove)}):")
+            for path in sorted(self.files_to_remove):
+                print(f"  - {path}")
+
+        if self.users_changed:
+            print("\nUser configuration changed.")
+
 
 @dataclass
 class Config:
@@ -744,19 +778,24 @@ def setup_var_pacman_symlink(var_path: Path):
     force_symlink(pacman_link, "../../../current/pacman")
 
 
-def check_upgrades_available(mount_root: Path) -> bool:
-    """Check if package upgrades are available."""
+def get_available_upgrades(mount_root: Path) -> list[str]:
+    """Get list of available package upgrades. Returns empty list if none."""
     try:
-        chroot_run(mount_root, "checkupdates", capture_output=True)
-        return True
+        output = chroot_run(mount_root, "checkupdates", capture_output=True)
+        return output.strip().split('\n') if output.strip() else []
     except subprocess.CalledProcessError as e:
         if e.returncode == 2:
-            return False  # No updates available
+            return []  # No updates available
         # Exit code 1 = unknown failure
         print(f"Warning: checkupdates failed (exit code {e.returncode})")
         if e.stderr:
             print(f"  {e.stderr.strip()}")
         raise
+
+
+def check_upgrades_available(mount_root: Path) -> bool:
+    """Check if package upgrades are available."""
+    return len(get_available_upgrades(mount_root)) > 0
 
 
 def count_packages(mount_root: Path) -> int:
@@ -1359,6 +1398,87 @@ def apply_configuration(
     return 0
 
 
+def check_configuration(
+    config_path: Path,
+    image_path: Path | None,
+    btrfs_dev: Path | None,
+    esp_dev: Path | None,
+    upgrade: bool,
+) -> int:
+    """Check what would change without building (dry-run mode)."""
+    with ExitStack() as stack:
+        config = load_config_module(config_path)
+        if config is None:
+            print("Error: Could not load configuration.")
+            return 1
+
+        if image_path:
+            if btrfs_dev is not None or esp_dev is not None:
+                print("Error: --btrfs and --esp not supported in combination with --image")
+                return 1
+            esp_dev, btrfs_dev = stack.enter_context(loop_device(image_path))
+        elif btrfs_dev is None and esp_dev is None:
+            detected = detect_darch_system()
+            if detected:
+                btrfs_dev, esp_dev = detected
+            else:
+                print("Error: --image or (--btrfs and --esp) required")
+                return 1
+        elif btrfs_dev is None or esp_dev is None:
+            print("Error: --btrfs and --esp must both be specified")
+            return 1
+
+        images = stack.enter_context(mount(btrfs_dev, Path("/mnt/darch-images"), "subvol=@images"))
+
+        # Find current complete generation
+        gens = get_generations(images)
+        complete_gens = [g for g in gens if g.complete]
+
+        if not complete_gens:
+            print("No existing generations. A fresh build would be performed.")
+            print(f"\nPackages to install ({len(config.packages)}):")
+            for pkg in sorted(config.packages):
+                print(f"  + {pkg}")
+            print(f"\nFiles to create ({len(config.files)}):")
+            for path in sorted(config.files):
+                print(f"  + {path}")
+            return 0
+
+        current = complete_gens[-1]
+
+        # Add runtime-dependent files before diffing
+        esp_uuid = run(["blkid", "-s", "UUID", "-o", "value", esp_dev], capture_output=True)
+        root_uuid = run(["blkid", "-s", "UUID", "-o", "value", btrfs_dev], capture_output=True)
+        config.add_file("/etc/fstab", generate_fstab(esp_uuid, root_uuid))
+
+        # Load old config and compute diff
+        with mount(btrfs_dev, Path("/mnt/darch-old"), f"subvol=@images/gen-{current.gen}") as old_gen:
+            old_config = load_gen_config(old_gen)
+            if old_config is None:
+                print(f"gen-{current.gen} has no config.json. A fresh build would be performed.")
+                return 0
+
+            diff = ConfigDiff.compute(old_config, config)
+            diff.print_summary()
+
+            # Check for upgrades if requested
+            if upgrade:
+                upgrades = get_available_upgrades(old_gen)
+                if upgrades:
+                    print(f"\nPackage upgrades available ({len(upgrades)}):")
+                    for line in upgrades:
+                        print(f"  ^ {line}")
+                else:
+                    print("\nNo package upgrades available.")
+
+            if not diff.has_changes() and not (upgrade and upgrades):
+                print("\nAlready up to date. No build needed.")
+            else:
+                print(f"\nA new generation (gen-{current.gen + 1}) would be built.")
+
+    return 0
+
+
 def find_ovmf() -> tuple[Path, Path] | None:
     """Find OVMF firmware files for UEFI boot."""
     ovmf_paths = [
@@ -1479,6 +1599,14 @@ def main() -> int:
     p_test.add_argument("--cpus", type=int, default=2, help="Number of CPUs (default: 2)")
     p_test.add_argument("--graphics", action="store_true", help="Enable graphical display (virtio-gpu)")
 
+    # check command
+    p_check = subparsers.add_parser("check", help="Check what would change without building (dry-run)")
+    p_check.add_argument("--config", default="./config.py", help="Path to config.py", type=path_type)
+    p_check.add_argument("--image", help="Path to disk image", type=path_type)
+    p_check.add_argument("--btrfs", help="Btrfs device (e.g., /dev/nvme0n1p2)", type=path_type)
+    p_check.add_argument("--esp", help="ESP device (e.g., /dev/nvme0n1p1)", type=path_type)
+    p_check.add_argument("--upgrade", action="store_true", help="Also check for package upgrades")
+
     args = parser.parse_args()
 
     if args.command == "test":
@@ -1504,6 +1632,15 @@ def main() -> int:
             upgrade = args.upgrade,
             rebuild = args.rebuild,
             switch = args.switch,
+        )
+
+    if args.command == "check":
+        return check_configuration(
+            config_path = args.config,
+            image_path = args.image,
+            btrfs_dev = args.btrfs,
+            esp_dev = args.esp,
+            upgrade = args.upgrade,
         )
 
     parser.print_help()
