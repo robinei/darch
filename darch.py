@@ -9,6 +9,8 @@ Creates bootable disk images with:
 - Atomic updates via symlink switching
 """
 
+# pylint: disable=line-too-long,too-many-lines,too-many-locals
+
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -65,8 +67,8 @@ class User:
 
     def _validate_path(self, path: str) -> None:
         """Validate a user file path."""
-        if not path.startswith("~"):
-            raise ValueError(f"User file path must start with '~': {path}")
+        if not path.startswith("~/"):
+            raise ValueError(f"User file path must start with '~/': {path}")
         if ".." in path:
             raise ValueError(f"User file path cannot contain '..': {path}")
 
@@ -76,13 +78,13 @@ class User:
         return self
 
     def add_file(self, path: str, content: str, mode: int | None = None) -> User:
-        """Add a file to the user's home directory. Path must start with ~."""
+        """Add a file to the user's home directory. Path must start with ~/."""
         self._validate_path(path)
         self.files[path] = ('file', content, mode)
         return self
 
     def add_symlink(self, path: str, target: str) -> User:
-        """Add a symlink in the user's home directory. Path must start with ~."""
+        """Add a symlink in the user's home directory. Path must start with ~/."""
         self._validate_path(path)
         self.files[path] = ('symlink', target)
         return self
@@ -152,30 +154,17 @@ class ConfigDiff:
             print("No configuration changes.")
             return
 
-        if self.packages_to_install:
-            print(f"\nPackages to install ({len(self.packages_to_install)}):")
-            for pkg in sorted(self.packages_to_install):
-                print(f"  + {pkg}")
+        def print_list(label: str, items, prefix: str):
+            if items:
+                print(f"\n{label} ({len(items)}):")
+                for item in sorted(items):
+                    print(f"  {prefix} {item}")
 
-        if self.packages_to_remove:
-            print(f"\nPackages to remove ({len(self.packages_to_remove)}):")
-            for pkg in sorted(self.packages_to_remove):
-                print(f"  - {pkg}")
-
-        if self.files_to_add:
-            print(f"\nFiles to add ({len(self.files_to_add)}):")
-            for path in sorted(self.files_to_add):
-                print(f"  + {path}")
-
-        if self.files_to_update:
-            print(f"\nFiles to update ({len(self.files_to_update)}):")
-            for path in sorted(self.files_to_update):
-                print(f"  ~ {path}")
-
-        if self.files_to_remove:
-            print(f"\nFiles to remove ({len(self.files_to_remove)}):")
-            for path in sorted(self.files_to_remove):
-                print(f"  - {path}")
+        print_list("Packages to install", self.packages_to_install, "+")
+        print_list("Packages to remove", self.packages_to_remove, "-")
+        print_list("Files to add", self.files_to_add, "+")
+        print_list("Files to update", self.files_to_update, "~")
+        print_list("Files to remove", self.files_to_remove, "-")
 
         if self.users_changed:
             print("\nUser configuration changed.")
@@ -235,10 +224,16 @@ class Config:
         self.files[path] = ('symlink', target)
         return self
 
+    @staticmethod
+    def _unit_name(name: str) -> str:
+        """Ensure systemd unit name has a suffix."""
+        if not name.endswith(('.service', '.socket', '.timer', '.path', '.mount')):
+            return f"{name}.service"
+        return name
+
     def enable_service(self, name: str, target: str = "multi-user.target") -> Config:
         """Enable a systemd service (creates symlink in target.wants)."""
-        if not name.endswith(('.service', '.socket', '.timer', '.path', '.mount')):
-            name = f"{name}.service"
+        name = self._unit_name(name)
         return self.add_symlink(
             f"/etc/systemd/system/{target}.wants/{name}",
             f"/usr/lib/systemd/system/{name}"
@@ -246,9 +241,7 @@ class Config:
 
     def mask_service(self, name: str) -> Config:
         """Mask a systemd service (symlink to /dev/null)."""
-        if not name.endswith(('.service', '.socket', '.timer', '.path', '.mount')):
-            name = f"{name}.service"
-        return self.add_symlink(f"/etc/systemd/system/{name}", "/dev/null")
+        return self.add_symlink(f"/etc/systemd/system/{self._unit_name(name)}", "/dev/null")
 
     def set_timezone(self, tz: str) -> Config:
         """Set system timezone."""
@@ -322,10 +315,12 @@ class BuildInfo:
     package_count: int = 0      # Total packages in generation
 
     def to_dict(self) -> dict:
+        """Convert to dictionary."""
         return {"fresh": self.fresh, "package_count": self.package_count}
 
     @classmethod
-    def from_dict(cls, data: dict) -> "BuildInfo":
+    def from_dict(cls, data: dict) -> BuildInfo:
+        """Create from dictionary."""
         return cls(fresh=data.get("fresh", True), package_count=data.get("package_count", 0))
 
     def summary(self) -> str:
@@ -562,15 +557,14 @@ def configure_users(users: list[User], gen_root: Path, home_path: Path):
     etc = gen_root / "etc"
     user_names = {u.name for u in users}
 
-    # Read base system files, filtering out declarative users
-    passwd_lines = [l for l in (etc / "passwd").read_text().splitlines()
-                    if l and l.split(":")[0] not in user_names]
-    shadow_lines = [l for l in (etc / "shadow").read_text().splitlines()
-                    if l and l.split(":")[0] not in user_names]
-    group_lines = [l for l in (etc / "group").read_text().splitlines()
-                   if l and l.split(":")[0] not in user_names]
-    gshadow_lines = [l for l in (etc / "gshadow").read_text().splitlines()
-                     if l and l.split(":")[0] not in user_names]
+    def read_filtered(filename: str) -> list[str]:
+        return [l for l in (etc / filename).read_text().splitlines()
+                if l and l.split(":")[0] not in user_names]
+
+    passwd_lines = read_filtered("passwd")
+    shadow_lines = read_filtered("shadow")
+    group_lines = read_filtered("group")
+    gshadow_lines = read_filtered("gshadow")
 
     # Add user entries
     for user in users:
@@ -623,12 +617,16 @@ def configure_users(users: list[User], gen_root: Path, home_path: Path):
         new_group_lines.append(":".join(parts))
 
     # Write back to generation
-    (etc / "passwd").write_text("\n".join(passwd_lines) + "\n")
-    (etc / "shadow").write_text("\n".join(shadow_lines) + "\n")
-    (etc / "shadow").chmod(0o600)
-    (etc / "group").write_text("\n".join(new_group_lines) + "\n")
-    (etc / "gshadow").write_text("\n".join(gshadow_lines) + "\n")
-    (etc / "gshadow").chmod(0o600)
+    def write_lines(filename: str, lines: list[str], mode: int | None = None):
+        path = etc / filename
+        path.write_text("\n".join(lines) + "\n")
+        if mode:
+            path.chmod(mode)
+
+    write_lines("passwd", passwd_lines)
+    write_lines("shadow", shadow_lines, 0o600)
+    write_lines("group", new_group_lines)
+    write_lines("gshadow", gshadow_lines, 0o600)
 
     # Create home directories in @home
     for user in users:
@@ -645,9 +643,9 @@ def configure_users(users: list[User], gen_root: Path, home_path: Path):
             continue
         user_home = home_path / user.name
         for file_path, entry in user.files.items():
-            # Expand ~ to user's home directory
-            rel_path = file_path[2:] if file_path.startswith("~/") else file_path[1:]
-            path = user_home / rel_path
+            # Expand ~/ to user's home directory
+            assert file_path.startswith("~/")
+            path = user_home / file_path[2:]
 
             # Create parent directories with user ownership
             if not path.parent.exists():
@@ -667,14 +665,9 @@ def configure_users(users: list[User], gen_root: Path, home_path: Path):
                 print(f"  {user.name}: {file_path}")
             elif entry[0] == 'symlink':
                 target = entry[1]
-                # Expand ~ in symlink target
-                if target.startswith("~/"):
-                    target = str(user_home / target[2:])
-                elif target.startswith("~"):
-                    target = str(user_home / target[1:])
-                if path.exists() or path.is_symlink():
-                    path.unlink()
-                path.symlink_to(target)
+                if target.startswith("~"):
+                    target = str(user_home / target.lstrip("~/"))
+                force_symlink(path, target)
                 os.lchown(path, user.uid, user.uid)
                 print(f"  {user.name}: {file_path} -> {target}")
 
@@ -683,20 +676,6 @@ def configure_users(users: list[User], gen_root: Path, home_path: Path):
 # Build context and functions
 # =============================================================================
 
-@dataclass
-class BuildContext:
-    """Runtime context for a build - paths and UUIDs discovered during setup."""
-    mount_root: Path     # Where generation is mounted
-    efi_mount: Path      # Where ESP is mounted
-    var_path: Path       # Where @var is mounted (or will be mounted)
-    btrfs_dev: Path      # Btrfs device path (for mounting @var)
-    esp_uuid: str        # UUID of ESP partition
-    root_uuid: str       # UUID of btrfs partition
-    gen: int = 1         # Generation number
-    fresh_install: bool = True  # False for rebuild of existing system
-    upgrade: bool = False       # Run pacman -Syu
-
-
 def run(cmd, check=True, capture_output=False) -> str:
     """Run a command and optionally capture output."""
     # Clean environment: remove locale vars to prevent host locale leaking into chroot
@@ -704,7 +683,7 @@ def run(cmd, check=True, capture_output=False) -> str:
            if not k.startswith("LC_") and k not in ("LANGUAGE",)}
     env["LC_ALL"] = "C"
 
-    cmd_str = ' '.join(str(c) for c in cmd)
+    #cmd_str = ' '.join(str(c) for c in cmd)
     #print(f"Running: {cmd_str}")
     if capture_output:
         result = subprocess.run(cmd, check=check, capture_output=True, text=True, env=env)
@@ -713,7 +692,7 @@ def run(cmd, check=True, capture_output=False) -> str:
     return ""
 
 
-def chroot_run(root: Path, *cmd, check=True, capture_output=False) -> str | None:
+def chroot_run(root: Path, *cmd, check=True, capture_output=False) -> str:
     """Run a command inside a chroot."""
     return run(["arch-chroot", root] + list(cmd), check=check, capture_output=capture_output)
 
@@ -749,9 +728,7 @@ def write_config_files(root: Path, files: Dict[str, FileEntry | SymlinkEntry]) -
             target = entry[1]
             if path.is_symlink() and os.readlink(path) == target:
                 continue
-            if path.exists() or path.is_symlink():
-                path.unlink()
-            path.symlink_to(target)
+            force_symlink(path, target)
             print(f"  symlink: {config_path}")
 
         changed.add(config_path)
@@ -788,137 +765,130 @@ def get_available_upgrades(mount_root: Path) -> list[str]:
         raise
 
 
-def check_upgrades_available(mount_root: Path) -> bool:
-    """Check if package upgrades are available."""
-    return len(get_available_upgrades(mount_root)) > 0
-
-
 def count_packages(mount_root: Path) -> int:
     """Count installed packages in a generation."""
     output = chroot_run(mount_root, "pacman", "--dbpath", "/pacman", "-Q", capture_output=True)
     return len(output.strip().split('\n')) if output.strip() else 0
 
 
-def build_generation(config: Config, ctx: BuildContext):
+def build_generation(config: Config, mount_root: Path, btrfs_dev: Path):
     """
     Build a generation from config into the mounted filesystem.
 
     Expects:
-    - ctx.mount_root: generation subvolume mounted here
-    - ctx.efi_mount: ESP mounted here
+    - mount_root: generation subvolume mounted here
     - @var NOT mounted (we mount it after moving pacman db)
     - Partitions already formatted, subvolumes already created
     """
     # Write config files before pacstrap so they exist for package install hooks
     print("\n=== Writing config files (pre-pacstrap) ===")
-    write_config_files(ctx.mount_root, config.files)
+    write_config_files(mount_root, config.files)
 
     print("\n=== Installing base system with pacstrap ===")
     # Bind-mount host's package cache so pacstrap reads/writes there.
     # On non-darch host: uses host cache. On darch system: uses @var cache.
-    gen_cache = ctx.mount_root / "var" / "cache" / "pacman" / "pkg"
+    gen_cache = mount_root / "var" / "cache" / "pacman" / "pkg"
     gen_cache.mkdir(parents=True, exist_ok=True)
     with mount(Path("/var/cache/pacman/pkg"), gen_cache, bind=True):
-        run(["pacstrap", "-K", ctx.mount_root] + sorted(config.packages))
+        run(["pacstrap", "-K", mount_root] + sorted(config.packages))
 
     print("\n=== Relocating pacman state to /pacman ===")
-    pacman_src = ctx.mount_root / "var" / "lib" / "pacman"
-    pacman_dst = ctx.mount_root / "pacman"
+    pacman_src = mount_root / "var" / "lib" / "pacman"
+    pacman_dst = mount_root / "pacman"
     if pacman_src.exists():
         shutil.move(pacman_src, pacman_dst)
         print(f"  Moved {pacman_src} -> {pacman_dst}")
 
     print("\n=== Creating /current -> . symlink (for build-time pacman access) ===")
-    force_symlink(ctx.mount_root / "current", ".")
+    force_symlink(mount_root / "current", ".")
 
     print("\n=== Removing /var from generation (will be @var mount point) ===")
-    var_in_gen = ctx.mount_root / "var"
+    var_in_gen = mount_root / "var"
     if var_in_gen.exists():
         shutil.rmtree(var_in_gen)
         print("  Removed /var from generation")
     var_in_gen.mkdir(exist_ok=True)
 
     print("\n=== Mounting @var and setting up pacman symlink ===")
-    with mount(ctx.btrfs_dev, var_in_gen, "subvol=@var"):
+    with mount(btrfs_dev, var_in_gen, "subvol=@var"):
         setup_var_pacman_symlink(var_in_gen)
 
         # Apply config.files (locale.gen, mkinitcpio.conf, hooks needed by chroot commands)
         print("\n=== Applying config files ===")
-        write_config_files(ctx.mount_root, config.files)
+        write_config_files(mount_root, config.files)
 
         print("\n=== Configuring system ===")
-        chroot_run(ctx.mount_root, "hwclock", "--systohc")
-        chroot_run(ctx.mount_root, "locale-gen")
-        chroot_run(ctx.mount_root, "passwd", "-d", "root")
-        chroot_run(ctx.mount_root, "mkinitcpio", "-P")
-        chroot_run(ctx.mount_root, "grub-install",
+        chroot_run(mount_root, "hwclock", "--systohc")
+        chroot_run(mount_root, "locale-gen")
+        chroot_run(mount_root, "passwd", "-d", "root")
+        chroot_run(mount_root, "mkinitcpio", "-P")
+        chroot_run(mount_root, "grub-install",
                    "--target=x86_64-efi", "--efi-directory=/efi",
                    "--boot-directory=/efi", "--bootloader-id=GRUB", "--removable")
 
         # Create tmpfiles.d overrides for darch layout
-        tmpfiles_dir = ctx.mount_root / "etc/tmpfiles.d"
+        tmpfiles_dir = mount_root / "etc/tmpfiles.d"
         tmpfiles_dir.mkdir(parents=True, exist_ok=True)
 
         # Override mtab line to not use L+ (force recreate)
-        etc_conf = (ctx.mount_root / "usr/lib/tmpfiles.d/etc.conf").read_text()
+        etc_conf = (mount_root / "usr/lib/tmpfiles.d/etc.conf").read_text()
         etc_conf = etc_conf.replace("L+ /etc/mtab", "L /etc/mtab")
         (tmpfiles_dir / "etc.conf").write_text(etc_conf)
 
         # Remove /root directory entries (darch has /root as symlink)
-        provision_conf = (ctx.mount_root / "usr/lib/tmpfiles.d/provision.conf").read_text()
+        provision_conf = (mount_root / "usr/lib/tmpfiles.d/provision.conf").read_text()
         provision_conf = re.sub(r'^[df].*\s/root.*\n', '', provision_conf, flags=re.MULTILINE)
         (tmpfiles_dir / "provision.conf").write_text(provision_conf)
 
         print("\n=== Setting up /etc symlinks ===")
         # Fix directory permissions (pacstrap/systemd may have changed them)
-        (ctx.var_path / "lib/machines").chmod(0o755)
+        (mount_root / "var/lib/machines").chmod(0o755)
 
         # resolv.conf: symlink to /run (systemd-resolved or NetworkManager will manage)
-        force_symlink(ctx.mount_root / "etc/resolv.conf", "/run/systemd/resolve/stub-resolv.conf")
+        force_symlink(mount_root / "etc/resolv.conf", "/run/systemd/resolve/stub-resolv.conf")
 
         # mtab: symlink to /proc/mounts (standard)
-        force_symlink(ctx.mount_root / "etc/mtab", "/proc/mounts")
+        force_symlink(mount_root / "etc/mtab", "/proc/mounts")
 
 
-def build_incremental(diff: ConfigDiff, ctx: BuildContext):
+def build_incremental(diff: ConfigDiff, mount_root: Path, btrfs_dev: Path, upgrade: bool):
     """
     Build a new generation incrementally from an existing one.
 
     Expects:
-    - ctx.mount_root: NEW generation subvolume mounted here (snapshot of old)
-    - ctx.efi_mount: ESP mounted here
+    - mount_root: NEW generation subvolume mounted here (snapshot of old)
     - @var NOT mounted (we mount it here)
-    - ctx.upgrade: if True, also run pacman -Syu
+    - upgrade: if True, also run pacman -Syu
     - diff: ConfigDiff between old and new config
     """
     # Generation already has /pacman_local and /current -> . from previous build
     # Mount @var so pacman can find its database via the symlink
-    with mount(ctx.btrfs_dev, ctx.var_path, "subvol=@var"):
+    with mount(btrfs_dev, mount_root / "var", "subvol=@var"):
         # Package changes - sync database first if installing or upgrading
-        if diff.packages_to_install or ctx.upgrade:
+        if diff.packages_to_install or upgrade:
             print("\n=== Syncing package database ===")
-            chroot_run(ctx.mount_root, "pacman", "-Sy")
+            chroot_run(mount_root, "pacman", "-Sy")
 
         if diff.packages_to_remove:
             print(f"\n=== Removing packages: {diff.packages_to_remove} ===")
-            chroot_run(ctx.mount_root, "pacman", "-Rns", "--noconfirm", *sorted(diff.packages_to_remove))
+            chroot_run(mount_root, "pacman", "-Rns", "--noconfirm", *sorted(diff.packages_to_remove))
 
         if diff.packages_to_install:
             print(f"\n=== Installing packages: {diff.packages_to_install} ===")
-            chroot_run(ctx.mount_root, "pacman", "-S", "--noconfirm", *sorted(diff.packages_to_install))
+            chroot_run(mount_root, "pacman", "-S", "--noconfirm", *sorted(diff.packages_to_install))
 
-        if ctx.upgrade:
+        if upgrade:
             print("\n=== Upgrading system packages ===")
-            chroot_run(ctx.mount_root, "pacman", "-Su", "--noconfirm")
+            chroot_run(mount_root, "pacman", "-Su", "--noconfirm")
 
         # Apply changed files
         files_to_write = {**diff.files_to_add, **diff.files_to_update}
         print("\n=== Applying config files ===")
-        changed_files = write_config_files(ctx.mount_root, files_to_write)
+        changed_files = write_config_files(mount_root, files_to_write)
 
         # Remove deleted files
         for path in diff.files_to_remove:
-            full_path = ctx.mount_root / path[1:]
+            full_path = mount_root / path[1:]
             if full_path.exists() or full_path.is_symlink():
                 full_path.unlink()
                 print(f"  removed: {path}")
@@ -926,7 +896,7 @@ def build_incremental(diff: ConfigDiff, ctx: BuildContext):
         # Regenerate locale if locale.gen changed
         if "/etc/locale.gen" in changed_files:
             print("\n=== Regenerating locales ===")
-            chroot_run(ctx.mount_root, "locale-gen")
+            chroot_run(mount_root, "locale-gen")
 
         # Check if initramfs needs regeneration
         initramfs_paths = {"/etc/mkinitcpio.conf", "/usr/lib/initcpio/hooks/darch",
@@ -935,7 +905,7 @@ def build_incremental(diff: ConfigDiff, ctx: BuildContext):
 
         if needs_initramfs:
             print("\n=== Regenerating initramfs ===")
-            chroot_run(ctx.mount_root, "mkinitcpio", "-P")
+            chroot_run(mount_root, "mkinitcpio", "-P")
 
 
 def detect_darch_system() -> tuple[Path, Path] | None:
@@ -955,7 +925,7 @@ def detect_darch_system() -> tuple[Path, Path] | None:
     # Parse /proc/mounts to find devices
     btrfs_dev = None
     esp_dev = None
-    with open("/proc/mounts") as f:
+    with open("/proc/mounts", encoding="utf-8") as f:
         for line in f:
             parts = line.split()
             if len(parts) >= 3:
@@ -1071,7 +1041,7 @@ def mount(device: Path, mount_point: Path, options: str | None = None, bind: boo
 
 
 @contextmanager
-def image_file(image_path: Path, size: str = "10G") -> Iterator[Tuple[Path, Path]]:
+def open_image_file(image_path: Path, image_size: str | None) -> Iterator[Tuple[Path, Path]]:
     """Create a blank disk image with ESP and btrfs partitions + subvolumes."""
 
     if image_path.exists():
@@ -1079,8 +1049,8 @@ def image_file(image_path: Path, size: str = "10G") -> Iterator[Tuple[Path, Path
         with loop_device(image_path) as result:
             yield result
     else:
-        print(f"=== Creating disk image: {image_path} ({size}) ===")
-        run(["truncate", "-s", size, image_path])
+        print(f"=== Creating disk image: {image_path} ({image_size}) ===")
+        run(["truncate", "-s", image_size, image_path])
 
         print("\n=== Partitioning disk ===")
         run(["sgdisk", "-Z", image_path])
@@ -1217,12 +1187,9 @@ def create_gen_subvol(images: Path, gen: int, snapshot_from: int | None = None):
         run(["btrfs", "subvol", "create", target])
 
 
-def load_gen_config(gen_path: Path) -> Config | None:
-    """Load config.json from mounted generation, or None if not found."""
-    config_file = gen_path / "config.json"
-    if not config_file.exists():
-        return None
-    return Config.from_json(config_file.read_text())
+def load_gen_config(gen_path: Path) -> Config:
+    """Load config.json from mounted generation."""
+    return Config.from_json((gen_path / "config.json").read_text())
 
 
 def load_config_module(config_path: Path) -> Config:
@@ -1252,37 +1219,73 @@ def load_config_module(config_path: Path) -> Config:
     return config
 
 
+def resolve_system(
+    exit_stack: ExitStack,
+    esp_dev: Path | None,
+    btrfs_dev: Path | None,
+    image_path: Path | None,
+    image_size: str | None = None,
+) -> Tuple[Path, Path, bool]:
+    """Resolve actual ESP partition device and BTRFS device, from command line arguments (and validate combination)"""
+    on_darch = False
+    if image_path:
+        if btrfs_dev is not None or esp_dev is not None:
+            raise CriticalError("--btrfs and --esp not supported in combination with --image")
+        esp_dev, btrfs_dev = exit_stack.enter_context(open_image_file(image_path, image_size))
+    elif btrfs_dev is None and esp_dev is None:
+        # Try auto-detection on darch system
+        detected = detect_darch_system()
+        if detected:
+            btrfs_dev, esp_dev = detected
+            on_darch = True
+            print(f"Detected darch system: btrfs={btrfs_dev}, esp={esp_dev}")
+        else:
+            raise CriticalError("--image or (--btrfs and --esp) required (or run on a booted darch system for auto-detection)")
+    elif btrfs_dev is None or esp_dev is None:
+        raise CriticalError("--btrfs and --esp must both be specified")
+    return (esp_dev, btrfs_dev, on_darch)
+
+
+def get_partition_uuid(partition_dev: Path) -> str:
+    """Get UUID of given partition."""
+    return run(["blkid", "-s", "UUID", "-o", "value", partition_dev], capture_output=True)
+
+
+def compute_generation_changes(config: Config, btrfs_dev: Path, gen: int, upgrade: bool) -> Tuple[ConfigDiff, list[str]]:
+    """Mount specified generation and diff config against given diff, as well as check for package upgrades (if upgrade==True)"""
+    with mount(btrfs_dev, Path("/mnt/darch-old"), f"subvol=@images/gen-{gen}") as old_gen:
+        old_config = load_gen_config(old_gen)
+        diff = ConfigDiff.compute(old_config, config)
+        upgrades = get_available_upgrades(old_gen) if upgrade else []
+        return (diff, upgrades)
+
+
 def apply_configuration(
     config_path: Path,
+    esp_dev: Path | None,
+    btrfs_dev: Path | None,
     image_path: Path | None,
     image_size: str,
-    btrfs_dev: Path | None,
-    esp_dev: Path | None,
     upgrade: bool,
     rebuild: bool,
     switch: bool,
-) -> int:
+):
     """Applies the provided config to the system found in 'image' or 'btrfs'/'esp'"""
+    if os.geteuid() != 0:
+        raise CriticalError("This command must be run as root")
+
     with ExitStack() as stack:
         stack.enter_context(lockfile())
+
         config = load_config_module(config_path)
 
-        on_darch = False
-        if image_path:
-            if btrfs_dev is not None or esp_dev is not None:
-                raise CriticalError("--btrfs and --esp not supported in combination with --image")
-            esp_dev, btrfs_dev = stack.enter_context(image_file(image_path, image_size))
-        elif btrfs_dev is None and esp_dev is None:
-            # Try auto-detection on darch system
-            detected = detect_darch_system()
-            if detected:
-                btrfs_dev, esp_dev = detected
-                on_darch = True
-                print(f"Detected darch system: btrfs={btrfs_dev}, esp={esp_dev}")
-            else:
-                raise CriticalError("--image or (--btrfs and --esp) required (or run on a booted darch system for auto-detection)")
-        elif btrfs_dev is None or esp_dev is None:
-            raise CriticalError("--btrfs and --esp must both be specified")
+        esp_dev, btrfs_dev, on_darch = resolve_system(
+            exit_stack=stack,
+            esp_dev=esp_dev,
+            btrfs_dev=btrfs_dev,
+            image_path=image_path,
+            image_size=image_size,
+        )
 
         images = stack.enter_context(mount(btrfs_dev, Path("/mnt/darch-images"), "subvol=@images"))
 
@@ -1290,30 +1293,22 @@ def apply_configuration(
         garbage_collect_generations(images)
 
         # Find current complete generation
-        gens = get_generations(images)
-        complete_gens = [g for g in gens if g.complete]
+        complete_gens = [g for g in get_generations(images) if g.complete]
         current = complete_gens[-1].gen if complete_gens else None
         new_gen = (current or 0) + 1
 
         # Get UUIDs and add runtime-dependent files before diffing
-        esp_uuid = run(["blkid", "-s", "UUID", "-o", "value", esp_dev], capture_output=True)
-        root_uuid = run(["blkid", "-s", "UUID", "-o", "value", btrfs_dev], capture_output=True)
+        esp_uuid = get_partition_uuid(esp_dev)
+        root_uuid = get_partition_uuid(btrfs_dev)
         config.add_file("/etc/fstab", generate_fstab(esp_uuid, root_uuid))
 
         fresh = current is None or rebuild
         diff = None
         if not fresh:
-            # Check for changes before creating new generation
-            with mount(btrfs_dev, Path("/mnt/darch-old"), f"subvol=@images/gen-{current}") as old_gen:
-                old_config = load_gen_config(old_gen)
-                if old_config is None:
-                    print(f"gen-{current} has no config.json, forcing rebuild")
-                    fresh = True
-                else:
-                    diff = ConfigDiff.compute(old_config, config)
-                    if not diff.has_changes() and not (upgrade and check_upgrades_available(old_gen)):
-                        print("Already up to date.")
-                        return
+            diff, upgrades = compute_generation_changes(config=config, btrfs_dev=btrfs_dev, gen=current, upgrade=upgrade)
+            if not diff.has_changes() and not upgrades:
+                print("Already up to date.")
+                return
 
         # Create and mount new generation
         create_gen_subvol(images, new_gen, snapshot_from=None if fresh else current)
@@ -1322,20 +1317,12 @@ def apply_configuration(
         stack.enter_context(mount(esp_dev, mount_root / "efi"))
         # Note: @var is mounted by builder functions, not here
 
-        ctx = BuildContext(
-            mount_root=mount_root,
-            efi_mount=mount_root / "efi",
-            var_path=mount_root / "var",
-            btrfs_dev=btrfs_dev,
-            esp_uuid=esp_uuid,
-            root_uuid=root_uuid,
-            gen=new_gen,
-            fresh_install=fresh,
-            upgrade=upgrade,
-        )
-
         if fresh:
-            build_generation(config, ctx)
+            build_generation(
+                config=config,
+                mount_root=mount_root,
+                btrfs_dev=btrfs_dev,
+            )
         else:
             # For incremental builds, invalidate inherited config.json so a failed
             # build is clearly incomplete. Rename to .prev for debugging.
@@ -1344,28 +1331,33 @@ def apply_configuration(
                 old_config_file.rename(mount_root / "config.json.prev")
 
             assert diff is not None
-            build_incremental(diff, ctx)
+            build_incremental(
+                diff,
+                mount_root=mount_root,
+                btrfs_dev=btrfs_dev,
+                upgrade=upgrade,
+            )
 
         # Configure declarative users
         if config.users:
             print(f"\n=== Configuring users: {[u.name for u in config.users]} ===")
-            home_mount = ctx.mount_root / "home"
+            home_mount = mount_root / "home"
             home_mount.mkdir(exist_ok=True)
-            with mount(ctx.btrfs_dev, home_mount, "subvol=@home"):
-                configure_users(config.users, ctx.mount_root, home_mount)
+            with mount(btrfs_dev, home_mount, "subvol=@home"):
+                configure_users(config.users, mount_root, home_mount)
 
         # Save config and build info
         print("\n=== Saving config ===")
-        (ctx.mount_root / "config.json").write_text(config.to_json())
-        build_info = BuildInfo(fresh=fresh, package_count=count_packages(ctx.mount_root))
-        (ctx.mount_root / "build-info.json").write_text(json.dumps(build_info.to_dict()))
+        (mount_root / "config.json").write_text(config.to_json())
+        build_info = BuildInfo(fresh=fresh, package_count=count_packages(mount_root))
+        (mount_root / "build-info.json").write_text(json.dumps(build_info.to_dict()))
 
         # Write GRUB config with all complete generations
         print("\n=== Writing GRUB config ===")
         complete_gens = [g for g in get_generations(images) if g.complete]
-        grub_cfg = ctx.efi_mount / "grub" / "grub.cfg"
+        grub_cfg = mount_root / "efi" / "grub" / "grub.cfg"
         grub_cfg.parent.mkdir(parents=True, exist_ok=True)
-        grub_cfg.write_text(generate_grub_config(ctx.root_uuid, complete_gens))
+        grub_cfg.write_text(generate_grub_config(root_uuid, complete_gens))
 
         print(f"\n=== SUCCESS: Built gen-{new_gen} ===")
 
@@ -1381,34 +1373,29 @@ def apply_configuration(
 
 def check_configuration(
     config_path: Path,
-    image_path: Path | None,
-    btrfs_dev: Path | None,
     esp_dev: Path | None,
+    btrfs_dev: Path | None,
+    image_path: Path | None,
     upgrade: bool,
-) -> int:
+):
     """Check what would change without building (dry-run mode)."""
+    if os.geteuid() != 0:
+        raise CriticalError("This command must be run as root")
+
     with ExitStack() as stack:
         config = load_config_module(config_path)
 
-        if image_path:
-            if btrfs_dev is not None or esp_dev is not None:
-                raise CriticalError("--btrfs and --esp not supported in combination with --image")
-            esp_dev, btrfs_dev = stack.enter_context(loop_device(image_path))
-        elif btrfs_dev is None and esp_dev is None:
-            detected = detect_darch_system()
-            if detected:
-                btrfs_dev, esp_dev = detected
-            else:
-                raise CriticalError("--image or (--btrfs and --esp) required")
-        elif btrfs_dev is None or esp_dev is None:
-            raise CriticalError("--btrfs and --esp must both be specified")
+        esp_dev, btrfs_dev, _on_darch = resolve_system(
+            exit_stack=stack,
+            esp_dev=esp_dev,
+            btrfs_dev=btrfs_dev,
+            image_path=image_path,
+        )
 
         images = stack.enter_context(mount(btrfs_dev, Path("/mnt/darch-images"), "subvol=@images"))
 
         # Find current complete generation
-        gens = get_generations(images)
-        complete_gens = [g for g in gens if g.complete]
-
+        complete_gens = [g for g in get_generations(images) if g.complete]
         if not complete_gens:
             print("No existing generations. A fresh build would be performed.")
             print(f"\nPackages to install ({len(config.packages)}):")
@@ -1418,38 +1405,30 @@ def check_configuration(
             for path in sorted(config.files):
                 print(f"  + {path}")
             return
-
         current = complete_gens[-1]
 
         # Add runtime-dependent files before diffing
-        esp_uuid = run(["blkid", "-s", "UUID", "-o", "value", esp_dev], capture_output=True)
-        root_uuid = run(["blkid", "-s", "UUID", "-o", "value", btrfs_dev], capture_output=True)
+        esp_uuid = get_partition_uuid(esp_dev)
+        root_uuid = get_partition_uuid(btrfs_dev)
         config.add_file("/etc/fstab", generate_fstab(esp_uuid, root_uuid))
 
         # Load old config and compute diff
-        with mount(btrfs_dev, Path("/mnt/darch-old"), f"subvol=@images/gen-{current.gen}") as old_gen:
-            old_config = load_gen_config(old_gen)
-            if old_config is None:
-                print(f"gen-{current.gen} has no config.json. A fresh build would be performed.")
-                return
+        diff, upgrades = compute_generation_changes(config=config, btrfs_dev=btrfs_dev, gen=current.gen, upgrade=upgrade)
+        diff.print_summary()
 
-            diff = ConfigDiff.compute(old_config, config)
-            diff.print_summary()
-
-            # Check for upgrades if requested
-            if upgrade:
-                upgrades = get_available_upgrades(old_gen)
-                if upgrades:
-                    print(f"\nPackage upgrades available ({len(upgrades)}):")
-                    for line in upgrades:
-                        print(f"  ^ {line}")
-                else:
-                    print("\nNo package upgrades available.")
-
-            if not diff.has_changes() and not (upgrade and upgrades):
-                print("\nAlready up to date. No build needed.")
+        if upgrade:
+            if upgrades:
+                print(f"\nPackage upgrades available ({len(upgrades)}):")
+                for line in upgrades:
+                    print(f"  ^ {line}")
             else:
-                print(f"\nA new generation (gen-{current.gen + 1}) would be built.")
+                print("\nNo package upgrades available.")
+
+        if not diff.has_changes() and not upgrades:
+            print("\nAlready up to date. No build needed.")
+        else:
+            print(f"\nA new generation (gen-{current.gen + 1}) would be built.")
+
 
 
 def find_ovmf() -> tuple[Path, Path] | None:
@@ -1470,7 +1449,7 @@ def test_image(
     memory: str,
     cpus: int,
     graphics: bool,
-) -> int:
+):
     """Boot an image in QEMU for testing."""
     if not image_path.exists():
         raise CriticalError(f"Image file '{image_path}' not found")
@@ -1582,32 +1561,27 @@ def main():
             cpus = args.cpus,
             graphics = args.graphics,
         )
+    elif args.command == "apply":
+        apply_configuration(
+            config_path = args.config,
+            esp_dev = args.esp,
+            btrfs_dev = args.btrfs,
+            image_path = args.image,
+            image_size = args.size,
+            upgrade = args.upgrade,
+            rebuild = args.rebuild,
+            switch = args.switch,
+        )
+    elif args.command == "check":
+        check_configuration(
+            config_path = args.config,
+            esp_dev = args.esp,
+            btrfs_dev = args.btrfs,
+            image_path = args.image,
+            upgrade = args.upgrade,
+        )
     else:
-        # Commands below require root
-        if os.geteuid() != 0:
-            raise CriticalError("This command must be run as root")
-
-        if args.command == "apply":
-            apply_configuration(
-                config_path = args.config,
-                image_path = args.image,
-                image_size = args.size,
-                btrfs_dev = args.btrfs,
-                esp_dev = args.esp,
-                upgrade = args.upgrade,
-                rebuild = args.rebuild,
-                switch = args.switch,
-            )
-        elif args.command == "check":
-            check_configuration(
-                config_path = args.config,
-                image_path = args.image,
-                btrfs_dev = args.btrfs,
-                esp_dev = args.esp,
-                upgrade = args.upgrade,
-            )
-        else:
-            parser.print_help()
+        parser.print_help()
 
 
 if __name__ == "__main__":

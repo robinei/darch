@@ -1,7 +1,9 @@
 """My Arch configuration."""
+
+# pylint: disable=line-too-long,too-many-lines
+
 from pathlib import Path
 from darch import Config, User
-
 
 def configure() -> Config:
     """Configuration entry point."""
