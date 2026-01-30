@@ -100,6 +100,16 @@ class User:
             "files": {k: list(v) for k, v in self.files.items()},
         }
 
+    def account_dict(self) -> dict:
+        """Serialize just account info (not home files) for diffing."""
+        return {
+            "name": self.name,
+            "uid": self.uid,
+            "shell": self.shell,
+            "password_hash": self.password_hash,
+            "groups": sorted(self.groups),
+        }
+
     @classmethod
     def from_dict(cls, data: dict) -> "User":
         """Deserialize user from a dict."""
@@ -120,13 +130,16 @@ class ConfigDiff:
     files_to_add: Dict[str, FileEntry | SymlinkEntry]
     files_to_remove: Dict[str, FileEntry | SymlinkEntry]
     files_to_update: Dict[str, FileEntry | SymlinkEntry]
-    users_changed: bool
+    user_accounts_changed: bool  # passwd/shadow/group entries
+    user_files_changed: bool     # ~/files in @home (persistent)
 
     @classmethod
     def compute(cls, old: Config, new: Config) -> ConfigDiff:
         """Compare two configs and return the differences."""
-        old_users = json.dumps([u.to_dict() for u in old.users], sort_keys=True)
-        new_users = json.dumps([u.to_dict() for u in new.users], sort_keys=True)
+        old_accounts = json.dumps([u.account_dict() for u in old.users], sort_keys=True)
+        new_accounts = json.dumps([u.account_dict() for u in new.users], sort_keys=True)
+        old_files = json.dumps([u.files for u in old.users], sort_keys=True)
+        new_files = json.dumps([u.files for u in new.users], sort_keys=True)
         return cls(
             packages_to_install=new.packages - old.packages,
             packages_to_remove=old.packages - new.packages,
@@ -134,19 +147,24 @@ class ConfigDiff:
             files_to_remove={p: e for p, e in old.files.items() if p not in new.files},
             files_to_update={p: e for p, e in new.files.items()
                              if p in old.files and old.files[p] != e},
-            users_changed=old_users != new_users,
+            user_accounts_changed=old_accounts != new_accounts,
+            user_files_changed=old_files != new_files,
         )
 
-    def has_changes(self) -> bool:
-        """Check if this diff has any changes."""
+    def needs_new_generation(self) -> bool:
+        """Check if changes require building a new generation."""
         return bool(
             self.packages_to_install or
             self.packages_to_remove or
             self.files_to_add or
             self.files_to_remove or
             self.files_to_update or
-            self.users_changed
+            self.user_accounts_changed
         )
+
+    def has_changes(self) -> bool:
+        """Check if this diff has any changes (including user files)."""
+        return self.needs_new_generation() or self.user_files_changed
 
     def print_summary(self):
         """Print a human-readable summary of changes."""
@@ -166,8 +184,10 @@ class ConfigDiff:
         print_list("Files to update", self.files_to_update, "~")
         print_list("Files to remove", self.files_to_remove, "-")
 
-        if self.users_changed:
-            print("\nUser configuration changed.")
+        if self.user_accounts_changed:
+            print("\nUser accounts changed.")
+        if self.user_files_changed:
+            print("\nUser home files changed.")
 
 
 @dataclass
@@ -628,7 +648,12 @@ def configure_users(users: list[User], gen_root: Path, home_path: Path):
     write_lines("group", new_group_lines)
     write_lines("gshadow", gshadow_lines, 0o600)
 
-    # Create home directories in @home
+    # Create home directories and write user files
+    write_user_home_files(users, home_path)
+
+
+def write_user_home_files(users: list[User], home_path: Path):
+    """Write user home directories and files to @home (can be called without new generation)."""
     for user in users:
         user_home = home_path / user.name
         if not user_home.exists():
@@ -637,11 +662,8 @@ def configure_users(users: list[User], gen_root: Path, home_path: Path):
             os.chown(user_home, user.uid, user.uid)
             print(f"  Created home directory: {user_home}")
 
-    # Write user files to home directories
-    for user in users:
         if not user.files:
             continue
-        user_home = home_path / user.name
         for file_path, entry in user.files.items():
             # Expand ~/ to user's home directory
             assert file_path.startswith("~/")
@@ -1310,6 +1332,14 @@ def apply_configuration(
                 print("Already up to date.")
                 return
 
+            # If only user home files changed, update them without creating a new generation
+            if not diff.needs_new_generation() and not upgrades and diff.user_files_changed:
+                print("=== Updating user home files (no new generation needed) ===")
+                with mount(btrfs_dev, Path("/mnt/darch-home"), "subvol=@home") as home_mount:
+                    write_user_home_files(config.users, home_mount)
+                print("=== SUCCESS: Updated user home files ===")
+                return
+
         # Create and mount new generation
         create_gen_subvol(images, new_gen, snapshot_from=None if fresh else current)
         mount_root = Path("/mnt/darch-build")
@@ -1426,6 +1456,8 @@ def check_configuration(
 
         if not diff.has_changes() and not upgrades:
             print("\nAlready up to date. No build needed.")
+        elif not diff.needs_new_generation() and not upgrades:
+            print("\nOnly user home files changed. No new generation needed.")
         else:
             print(f"\nA new generation (gen-{current.gen + 1}) would be built.")
 
